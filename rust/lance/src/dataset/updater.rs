@@ -12,7 +12,7 @@ use lance_table::utils::stream::ReadBatchFutStream;
 use super::Dataset;
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
-use super::write::{GenericWriter, open_writer};
+use super::write::{GenericWriter, WriteParams, open_writer, open_writer_with_write_params};
 use crate::dataset::FileFragment;
 use crate::dataset::utils::SchemaAdapter;
 
@@ -49,6 +49,8 @@ pub struct Updater {
     finished: bool,
 
     deletion_restorer: DeletionRestorer,
+
+    write_params: Option<WriteParams>,
 }
 
 impl Updater {
@@ -65,6 +67,7 @@ impl Updater {
         deletion_vector: DeletionVector,
         schemas: Option<(Schema, Schema)>,
         batch_size: Option<u32>,
+        write_params: Option<WriteParams>,
     ) -> Result<Self> {
         let (write_schema, final_schema) = if let Some((write_schema, final_schema)) = schemas {
             (Some(write_schema), Some(final_schema))
@@ -97,6 +100,7 @@ impl Updater {
             schema_adapter: None,
             finished: false,
             deletion_restorer: DeletionRestorer::new(deletion_vector, legacy_batch_size),
+            write_params,
         })
     }
 
@@ -146,13 +150,25 @@ impl Updater {
             .data_storage_format
             .lance_file_version()?;
 
-        open_writer(
-            &self.fragment.dataset().object_store,
-            &schema,
-            &self.fragment.dataset().base,
-            data_storage_version,
-        )
-        .await
+        if let Some(write_params) = &self.write_params {
+            open_writer_with_write_params(
+                Some(self.fragment.dataset()),
+                &self.fragment.dataset().object_store,
+                &schema,
+                &self.fragment.dataset().base,
+                data_storage_version,
+                write_params,
+            )
+            .await
+        } else {
+            open_writer(
+                &self.fragment.dataset().object_store,
+                &schema,
+                &self.fragment.dataset().base,
+                data_storage_version,
+            )
+            .await
+        }
     }
 
     /// Update one batch.

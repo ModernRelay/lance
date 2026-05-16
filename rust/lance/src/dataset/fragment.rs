@@ -1547,6 +1547,17 @@ impl FileFragment {
         schemas: Option<(Schema, Schema)>,
         batch_size: Option<u32>,
     ) -> Result<Updater> {
+        self.updater_with_write_params(columns, schemas, batch_size, None)
+            .await
+    }
+
+    pub(crate) async fn updater_with_write_params<T: AsRef<str>>(
+        &self,
+        columns: Option<&[T]>,
+        schemas: Option<(Schema, Schema)>,
+        batch_size: Option<u32>,
+        write_params: Option<WriteParams>,
+    ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
         let mut with_row_addr = false;
@@ -1579,7 +1590,15 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default().as_ref().clone();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size).await
+        Updater::try_new(
+            self.clone(),
+            reader,
+            deletion_vector,
+            schemas,
+            batch_size,
+            write_params,
+        )
+        .await
     }
 
     pub async fn merge_columns(

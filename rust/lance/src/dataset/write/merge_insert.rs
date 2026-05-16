@@ -53,7 +53,7 @@ use crate::{
     dataset::{
         fragment::{FileFragment, FragReadConfig},
         transaction::{Operation, Transaction},
-        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
+        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer_with_write_params},
     },
     index::DatasetIndexInternalExt,
     io::exec::{
@@ -974,6 +974,7 @@ impl MergeInsertJob {
                 updated_fragments: Arc<Mutex<Vec<Fragment>>>,
                 reservation_size: usize,
                 current_version: u64,
+                write_params: WriteParams,
             ) -> Result<usize> {
                 // batches still have _rowaddr
                 let write_schema = batches[0]
@@ -998,11 +999,13 @@ impl MergeInsertJob {
                         .manifest()
                         .data_storage_format
                         .lance_file_version()?;
-                    let mut writer = open_writer(
+                    let mut writer = open_writer_with_write_params(
+                        Some(dataset.as_ref()),
                         &dataset.object_store,
                         &write_schema,
                         &dataset.base,
                         data_storage_version,
+                        &write_params,
                     )
                     .await?;
 
@@ -1058,10 +1061,11 @@ impl MergeInsertJob {
                     let update_schema = batches[0].schema();
                     let read_columns = update_schema.field_names();
                     let mut updater = fragment
-                        .updater(
+                        .updater_with_write_params(
                             Some(&read_columns),
                             Some((write_schema, dataset.schema().clone())),
                             None,
+                            Some(write_params),
                         )
                         .await?;
 
@@ -1273,6 +1277,7 @@ impl MergeInsertJob {
                         updated_fragments.clone(),
                         memory_size,
                         current_version,
+                        write_params.clone(),
                     );
                     tasks.spawn(fut);
                 }
@@ -2797,6 +2802,97 @@ mod tests {
         assert!(
             payloads.iter().any(|payload| payload == b"merge-external"),
             "{payloads:?}"
+        );
+    }
+
+    async fn indexed_blob_dataset_for_partial_merge(dataset_dir: &TempDir) -> Arc<Dataset> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field("blob", true),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_bytes(b"initial").unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                blob_builder.finish().unwrap(),
+                Arc::new(StringArray::from(vec!["tag"])),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let index_params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["id"], IndexType::Scalar, None, &index_params, false)
+            .await
+            .unwrap();
+
+        Arc::new(dataset)
+    }
+
+    async fn run_partial_merge_external_blob_update() -> (Arc<Dataset>, TempDir, TempDir) {
+        let dataset_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"partial-merge-external").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let dataset = indexed_blob_dataset_for_partial_merge(&dataset_dir).await;
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field("blob", true),
+        ]));
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri).unwrap();
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let (dataset, stats) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .with_allow_external_blob_outside_bases(true)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                [Ok(source_batch)],
+                source_schema,
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 0);
+
+        (dataset, dataset_dir, external_dir)
+    }
+
+    #[tokio::test]
+    async fn test_partial_merge_insert_allows_external_blobs_for_fragment_rewrite() {
+        let (dataset, _dataset_dir, _external_dir) = run_partial_merge_external_blob_update().await;
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].read().await.unwrap().as_ref(),
+            b"partial-merge-external"
         );
     }
 
