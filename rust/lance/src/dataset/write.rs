@@ -506,19 +506,8 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
-    let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
-        && schema.fields.iter().any(|field| field.is_blob_v2())
-    {
-        Some(Arc::new(
-            build_external_base_resolver(dataset, &params).await?,
-        ))
-    } else {
-        None
-    };
-    let source_store_registry = dataset
-        .map(|ds| ds.session.store_registry())
-        .unwrap_or_else(|| params.store_registry());
-    let source_store_params = params.store_params.clone().unwrap_or_default();
+    let writer_options =
+        writer_options_from_write_params(dataset, schema, storage_version, &params).await?;
 
     let writer_generator = WriterGenerator::new(
         object_store,
@@ -526,12 +515,12 @@ pub async fn do_write_fragments(
         schema,
         storage_version,
         target_bases_info,
-        external_base_resolver,
-        params.allow_external_blob_outside_bases,
-        params.external_blob_mode,
-        source_store_registry,
-        source_store_params,
-        params.blob_pack_file_size_threshold,
+        writer_options.external_base_resolver,
+        writer_options.allow_external_blob_outside_bases,
+        writer_options.external_blob_mode,
+        writer_options.source_store_registry,
+        writer_options.source_store_params,
+        writer_options.blob_pack_file_size_threshold,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -1058,6 +1047,28 @@ pub(crate) async fn open_writer_with_write_params(
     storage_version: LanceFileVersion,
     params: &WriteParams,
 ) -> Result<Box<dyn GenericWriter>> {
+    let writer_options =
+        writer_options_from_write_params(dataset, schema, storage_version, params).await?;
+
+    open_writer_with_options(
+        object_store,
+        schema,
+        base_dir,
+        storage_version,
+        WriterOptions {
+            add_data_dir: true,
+            ..writer_options
+        },
+    )
+    .await
+}
+
+async fn writer_options_from_write_params(
+    dataset: Option<&Dataset>,
+    schema: &Schema,
+    storage_version: LanceFileVersion,
+    params: &WriteParams,
+) -> Result<WriterOptions> {
     validate_external_blob_write_params(params)?;
 
     let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
@@ -1074,23 +1085,15 @@ pub(crate) async fn open_writer_with_write_params(
         .unwrap_or_else(|| params.store_registry());
     let source_store_params = params.store_params.clone().unwrap_or_default();
 
-    open_writer_with_options(
-        object_store,
-        schema,
-        base_dir,
-        storage_version,
-        WriterOptions {
-            add_data_dir: true,
-            external_base_resolver,
-            allow_external_blob_outside_bases: params.allow_external_blob_outside_bases,
-            external_blob_mode: params.external_blob_mode,
-            source_store_registry,
-            source_store_params,
-            blob_pack_file_size_threshold: params.blob_pack_file_size_threshold,
-            ..Default::default()
-        },
-    )
-    .await
+    Ok(WriterOptions {
+        external_base_resolver,
+        allow_external_blob_outside_bases: params.allow_external_blob_outside_bases,
+        external_blob_mode: params.external_blob_mode,
+        source_store_registry,
+        source_store_params,
+        blob_pack_file_size_threshold: params.blob_pack_file_size_threshold,
+        ..Default::default()
+    })
 }
 
 #[derive(Default)]

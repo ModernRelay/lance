@@ -1060,12 +1060,15 @@ impl MergeInsertJob {
                     // TODO: we could skip scanning row addresses we don't need.
                     let update_schema = batches[0].schema();
                     let read_columns = update_schema.field_names();
+                    // Keep this on the existing updater writer until row-level
+                    // blob-v2 partial rewrites have complete fragment metadata support.
+                    // Full-fragment rewrites above and new-fragment writes both use
+                    // the merge insert write params.
                     let mut updater = fragment
-                        .updater_with_write_params(
+                        .updater(
                             Some(&read_columns),
                             Some((write_schema, dataset.schema().clone())),
                             None,
-                            Some(write_params),
                         )
                         .await?;
 
