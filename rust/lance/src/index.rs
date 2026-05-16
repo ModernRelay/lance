@@ -1062,12 +1062,12 @@ impl DatasetIndexExt for Dataset {
         Ok(merged_segment)
     }
 
-    async fn commit_existing_index_segments(
-        &mut self,
+    async fn build_existing_index_segments_transaction(
+        &self,
         index_name: &str,
         column: &str,
         segments: Vec<impl IntoIndexSegment + Send>,
-    ) -> Result<()> {
+    ) -> Result<Transaction> {
         let Some(field) = self.schema().field(column) else {
             return Err(Error::index(format!(
                 "CreateIndex: column '{column}' does not exist"
@@ -1107,8 +1107,7 @@ impl DatasetIndexExt for Dataset {
             .any(|idx| idx.fields != [field.id])
         {
             return Err(Error::index(format!(
-                "Index name '{index_name}' already exists with different fields, \
-                please specify a different name"
+                "Index name '{index_name}' already exists with different fields,                 please specify a different name"
             )));
         }
         let removed_indices = existing_named_indices
@@ -1151,14 +1150,25 @@ impl DatasetIndexExt for Dataset {
             .flatten()
             .collect::<Vec<_>>();
 
-        let transaction = Transaction::new(
+        Ok(Transaction::new(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
             },
             None,
-        );
+        ))
+    }
+
+    async fn commit_existing_index_segments(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<impl IntoIndexSegment + Send>,
+    ) -> Result<()> {
+        let transaction = self
+            .build_existing_index_segments_transaction(index_name, column, segments)
+            .await?;
 
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
@@ -2444,7 +2454,7 @@ mod tests {
     use super::*;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{CommitBuilder, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
@@ -6274,6 +6284,89 @@ mod tests {
                 .all(|idx| idx.files.as_ref().is_some_and(|files| !files.is_empty())),
             "committed segment metadata should capture on-disk file info"
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_does_not_commit() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"seg1",
+        )
+        .await;
+
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg0), segment_from_metadata(&seg1)],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "building a transaction must not publish the index"
+        );
+        assert_eq!(transaction.read_version, dataset.manifest.version);
+        let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = &transaction.operation
+        else {
+            panic!("expected index creation transaction");
+        };
+        assert_eq!(new_indices.len(), 2);
+        assert!(removed_indices.is_empty());
+
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+        let indices = committed.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 2);
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use crate::dataset::transaction::Transaction;
 use crate::{Error, Result};
 
 /// A single physical segment of a logical index.
@@ -304,6 +305,19 @@ pub trait DatasetIndexExt {
         &self,
         source_segments: Vec<IndexMetadata>,
     ) -> Result<IndexMetadata>;
+
+    /// Build a transaction that publishes existing physical index segments.
+    ///
+    /// This stages the same manifest update as [`Self::commit_existing_index_segments`]
+    /// without advancing the dataset version. Callers that need a strict
+    /// stage-then-commit workflow can pass the returned transaction to
+    /// [`crate::dataset::CommitBuilder`].
+    async fn build_existing_index_segments_transaction(
+        &self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<impl IntoIndexSegment + Send>,
+    ) -> Result<Transaction>;
 
     /// Commit one or more existing physical index segments as a logical index.
     async fn commit_existing_index_segments(
