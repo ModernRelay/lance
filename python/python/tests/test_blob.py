@@ -535,6 +535,33 @@ def test_blob_extension_write_external(tmp_path):
         assert f.read() == b"hello"
 
 
+def test_blob_extension_merge_insert_external_outside_bases(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    blob_path.write_bytes(b"merge")
+    uri = blob_path.as_uri()
+
+    table = pa.table({"id": [1], "blob": lance.blob_array([b"initial"])})
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_external_merge_insert",
+        data_storage_version="2.2",
+    )
+
+    source = pa.table({"id": [2], "blob": lance.blob_array([uri])})
+    stats = (
+        ds.merge_insert("id")
+        .allow_external_blob_outside_bases(True)
+        .execute(source)
+    )
+
+    assert stats["num_inserted_rows"] == 1
+    payloads = []
+    for blob in ds.take_blobs("blob", indices=[0, 1]):
+        with blob as f:
+            payloads.append(f.read())
+    assert b"merge" in payloads
+
+
 @pytest.mark.parametrize(
     ("position", "size"),
     [

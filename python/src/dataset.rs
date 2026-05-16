@@ -289,6 +289,14 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn allow_external_blob_outside_bases(
+        mut slf: PyRefMut<'_, Self>,
+        allow: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.with_allow_external_blob_outside_bases(allow);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;

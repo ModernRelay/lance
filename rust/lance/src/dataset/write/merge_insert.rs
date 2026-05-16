@@ -339,6 +339,17 @@ struct MergeInsertParams {
     source_dedupe_behavior: SourceDedupeBehavior,
     // Number of inner commit retries for manifest version conflicts. Default is 20.
     commit_retries: Option<u32>,
+    // Allow writing external blob URIs that cannot be mapped to a registered base.
+    allow_external_blob_outside_bases: bool,
+}
+
+impl MergeInsertParams {
+    fn write_params(&self) -> WriteParams {
+        WriteParams {
+            allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
+            ..Default::default()
+        }
+    }
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -459,6 +470,7 @@ impl MergeInsertBuilder {
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
                 commit_retries: None,
+                allow_external_blob_outside_bases: false,
             },
         })
     }
@@ -554,6 +566,16 @@ impl MergeInsertBuilder {
     /// Default: 20
     pub fn commit_retries(&mut self, retries: u32) -> &mut Self {
         self.params.commit_retries = Some(retries);
+        self
+    }
+
+    /// Configure whether external blob URIs outside registered bases are allowed.
+    ///
+    /// By default, external blob URIs must resolve to a registered non-dataset-root
+    /// base path. Set this to true to store unmatched external URIs as absolute
+    /// references.
+    pub fn with_allow_external_blob_outside_bases(&mut self, allow: bool) -> &mut Self {
+        self.params.allow_external_blob_outside_bases = allow;
         self
     }
 
@@ -894,6 +916,7 @@ impl MergeInsertJob {
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
         current_version: u64,
+        write_params: WriteParams,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
@@ -1154,6 +1177,7 @@ impl MergeInsertJob {
                 batches: Vec<RecordBatch>,
                 new_fragments: Arc<Mutex<Vec<Fragment>>>,
                 reservation_size: usize,
+                write_params: WriteParams,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -1184,8 +1208,8 @@ impl MergeInsertJob {
                     &dataset.base,
                     write_schema,
                     stream,
-                    Default::default(), // TODO: support write params.
-                    None,               // Merge insert doesn't use target_bases
+                    write_params,
+                    None, // Merge insert doesn't use target_bases
                 )
                 .await?;
 
@@ -1258,6 +1282,7 @@ impl MergeInsertJob {
                         batches,
                         new_fragments.clone(),
                         memory_size,
+                        write_params.clone(),
                     );
                     tasks.spawn(fut);
                 }
@@ -1707,6 +1732,7 @@ impl MergeInsertJob {
                 self.dataset.clone(),
                 Box::pin(stream),
                 self.dataset.manifest.version + 1,
+                self.params.write_params(),
             )
             .await?;
 
@@ -1731,7 +1757,7 @@ impl MergeInsertJob {
                 &self.dataset.base,
                 self.dataset.schema().clone(),
                 Box::pin(stream),
-                WriteParams::default(),
+                self.params.write_params(),
                 None, // Merge insert doesn't use target_bases
             )
             .await?;
@@ -2362,6 +2388,7 @@ impl Merger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::dataset::scanner::ColumnOrdering;
     use crate::dataset::write::merge_insert::inserted_rows::{
         KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
@@ -2391,7 +2418,7 @@ mod tests {
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::tempfile::{TempDir, TempStrDir};
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{BatchCount, Dimension, RowCount, Seed, array};
     use lance_index::IndexType;
@@ -2407,6 +2434,39 @@ mod tests {
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    fn blob_merge_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field("blob", true),
+        ]))
+    }
+
+    fn blob_batch(schema: Arc<Schema>, id: i32, blob_array: arrow_array::ArrayRef) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![id])), blob_array],
+        )
+        .unwrap()
+    }
+
+    async fn blob_merge_dataset(dataset_dir: &TempDir) -> Dataset {
+        let schema = blob_merge_schema();
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_bytes(b"initial").unwrap();
+        let batch = blob_batch(schema.clone(), 1, blob_builder.finish().unwrap());
+
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
     }
 
     async fn check_then_refresh_dataset(
@@ -2668,6 +2728,76 @@ mod tests {
         } else {
             panic!("expected InvalidInput error");
         }
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_rejects_external_blobs_outside_bases_by_default() {
+        let dataset_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"merge-external").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let dataset = Arc::new(blob_merge_dataset(&dataset_dir).await);
+        let schema = blob_merge_schema();
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri).unwrap();
+        let batch = blob_batch(schema.clone(), 2, blob_builder.finish().unwrap());
+
+        let err = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new([Ok(batch)], schema)))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("outside registered external bases"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_allows_external_blobs_outside_bases() {
+        let dataset_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"merge-external").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+
+        let dataset = Arc::new(blob_merge_dataset(&dataset_dir).await);
+        let schema = blob_merge_schema();
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_uri).unwrap();
+        let batch = blob_batch(schema.clone(), 2, blob_builder.finish().unwrap());
+
+        let (dataset, stats) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .with_allow_external_blob_outside_bases(true)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new([Ok(batch)], schema)))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_inserted_rows, 1);
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        let payloads = try_join_all(
+            blobs
+                .into_iter()
+                .map(|blob| async move { blob.read().await.map(|bytes| bytes.as_ref().to_vec()) }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            payloads.iter().any(|payload| payload == b"merge-external"),
+            "{payloads:?}"
+        );
     }
 
     #[tokio::test]

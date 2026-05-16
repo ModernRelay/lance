@@ -48,6 +48,8 @@ fn inner_merge_insert<'local>(
     let conflict_retries = extract_conflict_retries(env, &jparam)?;
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
+    let allow_external_blob_outside_bases =
+        extract_allow_external_blob_outside_bases(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -65,6 +67,7 @@ fn inner_merge_insert<'local>(
             .conflict_retries(conflict_retries)
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
+            .with_allow_external_blob_outside_bases(allow_external_blob_outside_bases)
             .try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
@@ -227,6 +230,16 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
         .call_method(jparam, "skipAutoCleanup", "()Z", &[])?
         .z()?;
     Ok(skip_auto_cleanup)
+}
+
+fn extract_allow_external_blob_outside_bases<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<bool> {
+    let allow_external_blob_outside_bases = env
+        .call_method(jparam, "allowExternalBlobOutsideBases", "()Z", &[])?
+        .z()?;
+    Ok(allow_external_blob_outside_bases)
 }
 
 const MERGE_STATS_CLASS: &str = "org/lance/merge/MergeInsertStats";

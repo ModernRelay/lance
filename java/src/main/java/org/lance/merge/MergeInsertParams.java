@@ -35,6 +35,7 @@ public class MergeInsertParams {
   private int conflictRetries = 10;
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
+  private boolean allowExternalBlobOutsideBases = false;
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -223,6 +224,23 @@ public class MergeInsertParams {
     return this;
   }
 
+  /**
+   * Configure whether external blob URIs outside registered bases are allowed.
+   *
+   * <p>By default, external blob URIs must resolve to a registered non-dataset-root base path. Set
+   * this to true to store unmatched external URIs as absolute references during merge insert
+   * writes.
+   *
+   * @param allowExternalBlobOutsideBases Whether to allow external blob URIs outside registered
+   *     bases.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withAllowExternalBlobOutsideBases(
+      boolean allowExternalBlobOutsideBases) {
+    this.allowExternalBlobOutsideBases = allowExternalBlobOutsideBases;
+    return this;
+  }
+
   public List<String> on() {
     return on;
   }
@@ -275,6 +293,10 @@ public class MergeInsertParams {
     return skipAutoCleanup;
   }
 
+  public boolean allowExternalBlobOutsideBases() {
+    return allowExternalBlobOutsideBases;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -292,6 +314,7 @@ public class MergeInsertParams {
         .add("conflictRetries", conflictRetries)
         .add("retryTimeoutMs", retryTimeoutMs)
         .add("skipAutoCleanup", skipAutoCleanup)
+        .add("allowExternalBlobOutsideBases", allowExternalBlobOutsideBases)
         .toString();
   }
 

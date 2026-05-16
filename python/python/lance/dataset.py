@@ -410,6 +410,28 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).use_index(use_index)
 
+    def allow_external_blob_outside_bases(self, allow: bool) -> "MergeInsertBuilder":
+        """
+        Configure whether external blob URIs outside registered bases are allowed.
+
+        By default, external blob URIs must resolve to a registered non-dataset-root
+        base path. Set this to True to store unmatched external URIs as absolute
+        references during merge insert writes.
+
+        Parameters
+        ----------
+        allow : bool
+            Whether to allow external blob URIs outside registered bases.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).allow_external_blob_outside_bases(
+            allow
+        )
+
     def explain_plan(
         self, schema: Optional[pa.Schema] = None, verbose: bool = False
     ) -> str:
