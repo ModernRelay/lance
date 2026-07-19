@@ -11,7 +11,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
-use lance_index::scalar::inverted::InvertedIndex;
+use lance_index::scalar::index_files_to_table;
+use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexParams};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_table::format::IndexMetadata;
@@ -64,7 +65,7 @@ pub(crate) async fn finalize_segment_files_if_needed(
 
     let store = Arc::new(LanceIndexStore::from_dataset_for_new(
         dataset,
-        &segment.uuid.to_string(),
+        &segment.uuid,
     )?);
     lance_index::scalar::inverted::builder::merge_index_files(
         dataset.object_store.as_ref(),
@@ -118,7 +119,7 @@ pub(crate) async fn merge_segments(
     }
 
     let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid.to_string())?;
+    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = InvertedIndex::merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, field_id)?,
@@ -137,7 +138,7 @@ pub(crate) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: created_index.files,
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }
@@ -217,6 +218,15 @@ pub async fn load_segment_details(
             column
         ))
     })
+}
+
+/// Read one segment's [`InvertedIndexParams`]
+pub async fn load_segment_params(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+) -> Result<InvertedIndexParams> {
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+    InvertedIndex::load_params(&store).await
 }
 
 #[cfg(test)]

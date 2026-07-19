@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
-use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
     execution_plan::{Boundedness, EmissionType},
@@ -59,6 +57,13 @@ use crate::dataset::scanner::{
 };
 
 use super::utils::IoMetrics;
+
+fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
+    let schema = projection.to_schema();
+    let schema = crate::dataset::blob::public_blob_v2_binary_output_schema(&schema);
+    let schema: ArrowSchema = (&schema).into();
+    Arc::new(schema)
+}
 
 #[derive(Debug)]
 pub struct EvaluatedIndex {
@@ -328,6 +333,116 @@ struct FilteredReadStream {
     threading_mode: FilteredReadThreadingMode,
     /// Range to apply to the result stream if not already pushed down in planning phase
     scan_range_after_filter: Option<Range<u64>>,
+    /// Fragments planned non-empty, and their total planned rows; the output
+    /// side uses these to detect take-shaped plans (batch size resolves at
+    /// execute time, so the detection lives there too)
+    touched_fragments: usize,
+    planned_rows: u64,
+}
+
+/// Below this many fragments there are too few handoffs to be worth
+/// consolidating
+const CONSOLIDATE_MIN_FRAGMENTS: usize = 8;
+
+/// Above this per-fragment average, batches are big enough to amortize
+/// their handoff
+const CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT: u64 = 1024;
+
+/// Pump a take-shaped read on a spawned task, handing the consumer
+/// consolidated batches. Inline polling would otherwise execute the
+/// per-batch pipeline work on the consumer, which serializes concurrent
+/// small reads.
+fn consolidated_stream(
+    inner: SendableRecordBatchStream,
+    target: usize,
+) -> SendableRecordBatchStream {
+    let mut builder = RecordBatchReceiverStream::builder(inner.schema(), 4);
+    let tx = builder.tx();
+    builder.spawn(async move {
+        let mut stream = coalesce_batches(inner, target).boxed();
+        while let Some(item) = stream.next().await {
+            if tx.send(item).await.is_err() {
+                // Receiver dropped: the query was cancelled
+                break;
+            }
+        }
+        Ok(())
+    });
+    builder.build()
+}
+
+/// Merge batches up to `target` rows; batches already at the target pass
+/// through whole (never split). Order is preserved.
+fn coalesce_batches(
+    input: SendableRecordBatchStream,
+    target: usize,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    struct Coalescer {
+        input: SendableRecordBatchStream,
+        schema: SchemaRef,
+        target: usize,
+        buffered: Vec<RecordBatch>,
+        buffered_rows: usize,
+        exhausted: bool,
+    }
+
+    impl Coalescer {
+        fn ready_to_emit(&self) -> bool {
+            self.buffered_rows >= self.target || (self.exhausted && !self.buffered.is_empty())
+        }
+
+        fn buffer(&mut self, batch: RecordBatch) {
+            self.buffered_rows += batch.num_rows();
+            self.buffered.push(batch);
+        }
+
+        fn emit(&mut self) -> DataFusionResult<RecordBatch> {
+            self.buffered_rows = 0;
+            if self.buffered.len() > 1 {
+                let batch = arrow::compute::concat_batches(&self.schema, self.buffered.iter())?;
+                self.buffered.clear();
+                Ok(batch)
+            } else {
+                self.buffered.pop().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "coalesce_batches emitted with an empty buffer".to_string(),
+                    )
+                })
+            }
+        }
+    }
+
+    let schema = input.schema();
+    let coalescer = Coalescer {
+        input,
+        schema,
+        target,
+        buffered: Vec::new(),
+        buffered_rows: 0,
+        exhausted: false,
+    };
+    futures::stream::try_unfold(coalescer, |mut this| async move {
+        loop {
+            if this.ready_to_emit() {
+                return Ok(Some((this.emit()?, this)));
+            }
+            if this.exhausted {
+                return Ok(None);
+            }
+            match this.input.try_next().await? {
+                Some(batch) if batch.num_rows() >= this.target && !this.buffered.is_empty() => {
+                    // Emit the partial buffer on its own; the large batch
+                    // then passes through whole on the next iteration
+                    let out = this.emit()?;
+                    this.buffer(batch);
+                    return Ok(Some((out, this)));
+                }
+                Some(batch) if batch.num_rows() > 0 => this.buffer(batch),
+                Some(_) => {}
+                None => this.exhausted = true,
+            }
+        }
+    })
 }
 
 impl std::fmt::Debug for FilteredReadStream {
@@ -385,7 +500,7 @@ impl FilteredReadStream {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let output_schema = Arc::new(options.projection.to_arrow_schema());
+        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
 
         let obj_store = dataset.object_store.clone();
         // Explicit options take precedence; otherwise fall back to the
@@ -417,11 +532,14 @@ impl FilteredReadStream {
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map({
                 let scan_range_after_filter = scan_range_after_filter.clone();
+                let dataset = dataset.clone();
                 move |scoped_fragment| {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+                    let dataset = dataset.clone();
                     SpawnedTask::spawn(
-                        Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
+                        Self::read_fragment(dataset, scoped_fragment, metrics, limit)
+                            .in_current_span(),
                     )
                     .map(|thread_result| thread_result.unwrap())
                 }
@@ -429,6 +547,22 @@ impl FilteredReadStream {
             .buffered(fragment_readahead);
         let task_stream = fragment_streams.try_flatten().boxed();
 
+        // A batch never spans fragments, so a plan touching many fragments
+        // with few rows each emits one tiny batch per fragment. Fragments
+        // planned empty produce no batch and don't count. Filtered scans
+        // stay dense here: their planned rows are a pre-refine upper bound.
+        let (touched_fragments, planned_rows) =
+            plan.rows
+                .values()
+                .fold((0usize, 0u64), |(fragments, rows), ranges| {
+                    let fragment_rows: u64 =
+                        ranges.iter().map(|range| range.end - range.start).sum();
+                    if fragment_rows > 0 {
+                        (fragments + 1, rows + fragment_rows)
+                    } else {
+                        (fragments, rows)
+                    }
+                });
         Ok(Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
@@ -437,6 +571,8 @@ impl FilteredReadStream {
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
             scan_range_after_filter,
+            touched_fragments,
+            planned_rows,
         })
     }
 
@@ -997,6 +1133,10 @@ impl FilteredReadStream {
                     base_batch_stream.boxed()
                 };
 
+                // Clone so the finally handler can record a final snapshot even when
+                // no output batches were produced (inspect_ok never fires in that case).
+                let global_metrics_final = global_metrics.clone();
+                let scan_scheduler_final = scan_scheduler.clone();
                 let batch_stream = batch_stream
                     .inspect_ok(move |batch| {
                         partition_metrics_clone
@@ -1005,6 +1145,9 @@ impl FilteredReadStream {
                         global_metrics.io_metrics.record(&scan_scheduler);
                     })
                     .finally(move || {
+                        global_metrics_final
+                            .io_metrics
+                            .record(&scan_scheduler_final);
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
@@ -1067,13 +1210,15 @@ impl FilteredReadStream {
     }
 
     // Reads a single fragment into a stream of batch tasks
-    #[instrument(name = "read_fragment", skip_all)]
+    #[instrument(name = "read_fragment", level = "debug", skip_all)]
     async fn read_fragment(
+        dataset: Arc<Dataset>,
         mut fragment_read_task: ScopedFragmentRead,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         fragment_soft_limit: Option<u64>,
-    ) -> Result<impl Stream<Item = Result<ReadBatchFut>>> {
-        let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
+    ) -> Result<BoxStream<'static, Result<ReadBatchFut>>> {
+        let output_schema =
+            public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref());
 
         if let Some(filter) = &fragment_read_task.filter {
             let filter_cols = Planner::column_names_in_expr(filter);
@@ -1088,10 +1233,22 @@ impl FilteredReadStream {
             }
         }
 
-        let read_schema = fragment_read_task.projection.to_bare_schema();
+        let output_read_schema = Arc::new(fragment_read_task.projection.to_schema());
+        let bare_read_schema = fragment_read_task.projection.to_bare_schema();
+        let materialize_blob_v2_binary =
+            crate::dataset::blob::schema_has_blob_v2_binary_view(&bare_read_schema);
+        let read_schema = if materialize_blob_v2_binary {
+            crate::dataset::blob::blob_v2_descriptor_schema(&bare_read_schema)
+        } else {
+            bare_read_schema
+        };
+        let mut frag_read_config = fragment_read_task.frag_read_config();
+        if materialize_blob_v2_binary {
+            frag_read_config = frag_read_config.with_row_address(true);
+        }
         let mut fragment_reader = fragment_read_task
             .fragment
-            .open(&read_schema, fragment_read_task.frag_read_config())
+            .open(&read_schema, frag_read_config)
             .await?;
 
         if fragment_read_task.with_deleted_rows {
@@ -1105,8 +1262,9 @@ impl FilteredReadStream {
         let physical_filter = fragment_read_task
             .filter
             .map(|filter| {
-                let planner =
-                    Planner::new(Arc::new(fragment_read_task.projection.to_arrow_schema()));
+                let planner = Planner::new(public_blob_v2_binary_projection_schema(
+                    fragment_read_task.projection.as_ref(),
+                ));
                 planner.create_physical_expr(&filter)
             })
             .transpose()?;
@@ -1129,7 +1287,7 @@ impl FilteredReadStream {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();
                 let range_tracker = range_tracker.clone();
-                batch_fut
+                let batch_fut = batch_fut
                     .inspect_ok(move |batch| {
                         let num_rows = batch.num_rows();
                         global_metrics.rows_scanned.add(num_rows);
@@ -1144,7 +1302,23 @@ impl FilteredReadStream {
                             global_metrics.ranges_scanned.add(additional_ranges);
                         }
                     })
-                    .boxed()
+                    .boxed();
+                if materialize_blob_v2_binary {
+                    let dataset = dataset.clone();
+                    let output_read_schema = output_read_schema.clone();
+                    batch_fut
+                        .and_then(move |batch| async move {
+                            crate::dataset::blob::materialize_blob_v2_binary_batch(
+                                &dataset,
+                                output_read_schema.as_ref(),
+                                batch,
+                            )
+                            .await
+                        })
+                        .boxed()
+                } else {
+                    batch_fut
+                }
             })
             .zip(futures::stream::repeat((
                 physical_filter.clone(),
@@ -1152,12 +1326,11 @@ impl FilteredReadStream {
             )))
             .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
 
-        let result: Pin<Box<dyn Stream<Item = Result<ReadBatchFut>> + Send>> =
-            if let Some(limit) = fragment_soft_limit {
-                Box::pin(Self::apply_soft_limit(fragment_stream, limit))
-            } else {
-                Box::pin(fragment_stream)
-            };
+        let result = if let Some(limit) = fragment_soft_limit {
+            Self::apply_soft_limit(fragment_stream, limit).boxed()
+        } else {
+            fragment_stream.boxed()
+        };
         Ok(result)
     }
 
@@ -1475,6 +1648,19 @@ impl FilteredReadOptions {
         self.only_indexed_fragments = true;
         self
     }
+
+    /// Specify the threading mode to use for the scan.
+    ///
+    /// This controls how decode work is parallelized.  For the default single-partition
+    /// scan, the parameter of [`FilteredReadThreadingMode::OnePartitionMultipleThreads`]
+    /// bounds how many batch-decode tasks are buffered in flight (via `try_buffered`).
+    ///
+    /// The parallelism must be greater than 0.  A value of 0 is rejected by
+    /// [`FilteredReadExec::try_new`].
+    pub fn with_threading_mode(mut self, threading_mode: FilteredReadThreadingMode) -> Self {
+        self.threading_mode = threading_mode;
+        self
+    }
 }
 
 /// A plan node that reads a dataset, applying an optional filter and projection.
@@ -1566,6 +1752,23 @@ impl FilteredReadExec {
                 .into()));
         }
 
+        // A parallelism of 0 would cause `try_buffered(0)` to hang forever instead of erroring
+        match options.threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(0) => {
+                return Err(Error::invalid_input_source(
+                    "FilteredReadThreadingMode::OnePartitionMultipleThreads must be greater than 0, got 0"
+                        .into(),
+                ));
+            }
+            FilteredReadThreadingMode::MultiplePartitions(0) => {
+                return Err(Error::invalid_input_source(
+                    "FilteredReadThreadingMode::MultiplePartitions must be greater than 0, got 0"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+
         if options.scan_range_after_filter.is_some() {
             // Validate that there's a filter when using scan_range_after_filter
             if options.full_filter.is_none()
@@ -1588,7 +1791,7 @@ impl FilteredReadExec {
                 ));
             }
         }
-        let output_schema = Arc::new(options.projection.to_arrow_schema());
+        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -1732,7 +1935,14 @@ impl FilteredReadExec {
         // Second, multiple partitions all share the same underlying task stream (see get_stream)
         let running_stream_lock = self.running_stream.clone();
         let dataset = self.dataset.clone();
-        let options = self.options.clone();
+        let target_partitions = context.session_config().target_partitions();
+        let mut options = self.options.clone();
+        if let FilteredReadThreadingMode::OnePartitionMultipleThreads(n) = options.threading_mode {
+            options.threading_mode = FilteredReadThreadingMode::OnePartitionMultipleThreads(
+                n.min(target_partitions).max(1),
+            );
+        }
+        let batch_size_rows = options.batch_size;
         let batch_size_bytes = options
             .file_reader_options
             .as_ref()
@@ -1764,8 +1974,30 @@ impl FilteredReadExec {
                 *running_stream = Some(new_running_stream);
                 first_stream
             };
-            let stream: SendableRecordBatchStream = match batch_size_bytes {
-                Some(target) => {
+            // Only masked reads consolidate; plain scans keep their batch
+            // boundaries, and the byte-based rechunk merges on its own
+            let consolidate = if index_input.is_some() && batch_size_bytes.is_none() {
+                running_stream.as_ref().and_then(|running| {
+                    // Explicit option → lance env default → session batch size
+                    let batch_target_rows = batch_size_rows
+                        .map(|batch_size| batch_size as usize)
+                        .or_else(get_default_batch_size)
+                        .unwrap_or_else(|| context.session_config().batch_size());
+                    let is_sparse_plan = batch_target_rows > 0
+                        && running.touched_fragments >= CONSOLIDATE_MIN_FRAGMENTS
+                        && running.planned_rows
+                            < running.touched_fragments as u64
+                                * CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT;
+                    is_sparse_plan.then_some(batch_target_rows)
+                })
+            } else {
+                None
+            };
+            drop(running_stream);
+
+            let stream = match (consolidate, batch_size_bytes) {
+                (Some(target), _) => consolidated_stream(inner, target),
+                (None, Some(bytes)) => {
                     let schema = inner.schema();
                     Box::pin(RecordBatchStreamAdapter::new(
                         schema.clone(),
@@ -1773,11 +2005,11 @@ impl FilteredReadExec {
                             inner,
                             schema,
                             0,
-                            target as usize,
+                            bytes as usize,
                         ),
                     ))
                 }
-                None => inner,
+                (None, None) => inner,
             };
             DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
@@ -1879,10 +2111,6 @@ impl ExecutionPlan for FilteredReadExec {
         "FilteredReadExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -1902,7 +2130,7 @@ impl ExecutionPlan for FilteredReadExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion::error::Result<Statistics> {
+    ) -> datafusion::error::Result<Arc<Statistics>> {
         let fragments = self
             .options
             .fragments
@@ -1939,10 +2167,10 @@ impl ExecutionPlan for FilteredReadExec {
                 total_rows
             };
 
-            return Ok(Statistics {
+            return Ok(Arc::new(Statistics {
                 num_rows: Precision::Exact(total_rows as usize),
                 ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
-            });
+            }));
         };
 
         // We could evaluate the indexed filter here but this is still during the planning
@@ -1960,7 +2188,7 @@ impl ExecutionPlan for FilteredReadExec {
             .clone()
             .union_columns(filter_columns, OnMissing::Error)?;
 
-        let read_schema = Arc::new(read_projection.to_arrow_schema());
+        let read_schema = public_blob_v2_binary_projection_schema(&read_projection);
 
         let planner = Arc::new(Planner::new(read_schema.clone()));
         let physical_filter = planner.create_physical_expr(filter)?;
@@ -1977,7 +2205,7 @@ impl ExecutionPlan for FilteredReadExec {
             None,
         )?);
         let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-        let mut df_stats = df_filter_exec.partition_statistics(partition)?;
+        let mut df_stats = Arc::unwrap_or_clone(df_filter_exec.partition_statistics(partition)?);
 
         // If we have an after-filter range, we should apply it to the stats (the before-filter range
         // is applied in the mock input)
@@ -2013,7 +2241,7 @@ impl ExecutionPlan for FilteredReadExec {
             }
         });
 
-        Ok(df_stats)
+        Ok(Arc::new(df_stats))
     }
 
     fn with_new_children(
@@ -2129,7 +2357,9 @@ mod tests {
     };
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
+    use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::{
         IndexType,
@@ -2137,6 +2367,7 @@ mod tests {
         scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
     use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -2361,6 +2592,77 @@ mod tests {
         Arc::new(UInt32Array::from_iter_values(
             ranges.into_iter().flat_map(|r| r.into_iter()),
         ))
+    }
+
+    /// Take-shaped masked reads consolidate their tiny per-fragment batches;
+    /// few-fragment and dense masked reads keep per-fragment boundaries.
+    #[test_log::test(tokio::test)]
+    async fn test_take_shaped_mask_consolidation() {
+        // 20 fragments x 2000 rows, value = global row number
+        let tmp_path = TempStrDir::default();
+        let data = gen_batch()
+            .col("value", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(2000), BatchCount::from(20));
+        let dataset = Arc::new(
+            Dataset::write(
+                data,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: 2000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mask_input = |addrs: Vec<u64>| -> Arc<dyn ExecutionPlan> {
+            let covered: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+            let batch =
+                IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(addrs)))
+                    .serialize(&covered, IndexExprResultWireFormat::default())
+                    .unwrap();
+            let schema = batch.schema();
+            let stream = futures::stream::once(async move { Ok(batch) });
+            Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+                schema, stream,
+            ))))
+        };
+        let run = |input: Arc<dyn ExecutionPlan>| {
+            let dataset = dataset.clone();
+            async move {
+                // Pin the batch size so batch-count assertions don't depend
+                // on LANCE_DEFAULT_BATCH_SIZE
+                let options = FilteredReadOptions::basic_full_read(&dataset).with_batch_size(2000);
+                let plan =
+                    FilteredReadExec::try_new(dataset.clone(), options, Some(input)).unwrap();
+                let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+                stream.try_collect::<Vec<_>>().await.unwrap()
+            }
+        };
+        let addr = |frag: u32, offset: u32| u64::from(RowAddress::new_from_parts(frag, offset));
+
+        // Take shape: 20 fragments, 2 rows each -> one consolidated batch,
+        // rows in fragment order
+        let addrs: Vec<u64> = (0..20u32).flat_map(|f| [addr(f, 3), addr(f, 7)]).collect();
+        let batches = run(mask_input(addrs)).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 40);
+        assert_eq!(batches.len(), 1);
+        let expected =
+            UInt32Array::from_iter_values((0..20u32).flat_map(|f| [f * 2000 + 3, f * 2000 + 7]));
+        assert_eq!(batches[0].column(0).as_ref(), &expected);
+
+        // Too few fragments -> inline path, one batch per fragment
+        let batches = run(mask_input(vec![addr(0, 3), addr(1, 7)])).await;
+        assert_eq!(batches.len(), 2);
+
+        // Dense (2000 planned rows per fragment) -> inline path
+        let addrs: Vec<u64> = (0..8u32)
+            .flat_map(|f| (0..2000u32).map(move |o| addr(f, o)))
+            .collect();
+        let batches = run(mask_input(addrs)).await;
+        assert_eq!(batches.len(), 8);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 16000);
     }
 
     /// Round-trip every interval shape through the arrow wire format and
@@ -2954,10 +3256,7 @@ mod tests {
             assert_eq!(plan.options().scan_range_before_filter, None);
             assert_eq!(plan.fetch(), None);
             let new_plan = plan.with_fetch(Some(100)).unwrap();
-            let new_plan = new_plan
-                .as_any()
-                .downcast_ref::<FilteredReadExec>()
-                .unwrap();
+            let new_plan = new_plan.downcast_ref::<FilteredReadExec>().unwrap();
             assert_eq!(new_plan.options().scan_range_before_filter, Some(0..100));
             assert_eq!(new_plan.fetch(), Some(100));
         }
@@ -2985,10 +3284,7 @@ mod tests {
             assert_eq!(plan.options().scan_range_after_filter, None);
             assert_eq!(plan.fetch(), None);
             let new_plan = plan.with_fetch(Some(50)).unwrap();
-            let new_plan = new_plan
-                .as_any()
-                .downcast_ref::<FilteredReadExec>()
-                .unwrap();
+            let new_plan = new_plan.downcast_ref::<FilteredReadExec>().unwrap();
             assert_eq!(new_plan.options().scan_range_after_filter, Some(0..50));
             assert_eq!(new_plan.fetch(), Some(50));
         }
@@ -3042,10 +3338,7 @@ mod tests {
         assert!(plan.options().refine_filter.is_some());
 
         let limited_plan = plan.with_fetch(Some(10)).unwrap();
-        let limited_plan = limited_plan
-            .as_any()
-            .downcast_ref::<FilteredReadExec>()
-            .unwrap();
+        let limited_plan = limited_plan.downcast_ref::<FilteredReadExec>().unwrap();
         assert_eq!(limited_plan.options().scan_range_after_filter, Some(0..10));
 
         let stream = limited_plan
@@ -3716,6 +4009,55 @@ mod tests {
         assert!(iops > 0, "Should have recorded IO operations");
     }
 
+    // Reproduces a bug where bytes_read (and iops/requests) stay at 0 when a filter matches
+    // no rows. io_metrics.record is only called inside inspect_ok on the output batch stream,
+    // so when the filter produces zero output batches, the I/O that did occur is never counted.
+    #[tokio::test]
+    async fn test_io_metrics_recorded_when_filter_matches_no_rows() {
+        let fixture = TestFixture::new().await;
+        // not_indexed values in the fixture go up to ~400; this filter matches nothing
+        let filter_plan = fixture.filter_plan("not_indexed > 10000", false).await;
+        let options =
+            FilteredReadOptions::basic_full_read(&fixture.dataset).with_filter_plan(filter_plan);
+        let filtered_read =
+            Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
+
+        let batches = filtered_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            0,
+            "filter should match no rows"
+        );
+
+        let metrics = filtered_read.metrics().unwrap();
+
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            rows_scanned > 0,
+            "rows_scanned ({}) should be > 0: data was read even though filter matched nothing",
+            rows_scanned
+        );
+
+        let bytes_read = metrics
+            .sum_by_name("bytes_read")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            bytes_read > 0,
+            "bytes_read ({}) should be > 0: io_metrics.record is only called when output batches \
+             are produced, so bytes_read stays 0 even though I/O occurred",
+            bytes_read
+        );
+    }
+
     /// Test that direct execution gives the same result as get_plan + execute_with_plan
     #[test_log::test(tokio::test)]
     async fn test_plan_round_trip() {
@@ -3797,5 +4139,38 @@ mod tests {
         for i in 0..result1.num_columns() {
             assert_eq!(result1.column(i).as_ref(), result3.column(i).as_ref());
         }
+    }
+
+    /// Verify that executing with target_partitions=1 produces the same results as the default
+    /// context and does not panic. This is a regression guard for the parallelism cap.
+    #[test_log::test(tokio::test)]
+    async fn test_target_partitions_cap_produces_correct_results() {
+        use datafusion::prelude::SessionConfig;
+
+        let fixture = TestFixture::new().await;
+
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let plan =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None).unwrap();
+
+        // Execute with default context (high thread count)
+        let default_ctx = Arc::new(TaskContext::default());
+        let stream = plan.execute(0, default_ctx).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let default_result = concat_batches(&schema, &batches).unwrap();
+
+        // Execute fresh plan with target_partitions=1
+        let plan2 = FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap();
+        let low_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::default().with_target_partitions(1)),
+        );
+        let stream2 = plan2.execute(0, low_ctx).unwrap();
+        let schema2 = stream2.schema();
+        let batches2 = stream2.try_collect::<Vec<_>>().await.unwrap();
+        let capped_result = concat_batches(&schema2, &batches2).unwrap();
+
+        assert_eq!(default_result.num_rows(), capped_result.num_rows());
     }
 }

@@ -3,12 +3,10 @@
 
 use std::sync::{Arc, LazyLock};
 
-use super::utils::{
-    IndexMetrics, InstrumentedChildInputStream, InstrumentedRecordBatchStreamAdapter,
-};
+use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
-    dataset::rowids::load_row_id_sequences,
+    dataset::rowids::{load_row_id_sequence, load_row_id_sequences},
     index::{
         prefilter::DatasetPreFilter,
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
@@ -22,7 +20,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
-        metrics::{ExecutionPlanMetricsSet, MetricsSet},
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
@@ -44,7 +42,8 @@ use lance_index::{
     },
 };
 use lance_select::{
-    IndexExprResult, RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+    IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
+    RowAddrSelection, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -60,6 +59,112 @@ impl ScalarIndexLoader for Dataset {
     ) -> Result<Arc<dyn ScalarIndex>> {
         open_named_scalar_index(self, column, index_name, metrics).await
     }
+
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        // Addresses and row ids only diverge under stable row ids; otherwise the
+        // address is the row id and there is nothing to translate.
+        if !self.manifest.uses_stable_row_ids() {
+            return Ok(result);
+        }
+
+        let NullableIndexExprResult { lower, upper, .. } = result;
+        let lower = translate_addr_mask_to_row_ids(self, lower).await?;
+        let upper = translate_addr_mask_to_row_ids(self, upper).await?;
+        Ok(NullableIndexExprResult::new(lower, upper))
+    }
+}
+
+/// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
+///
+/// Address-domain index results are always positive allow-lists (`AtMost`), so
+/// a block-list here would mean a boolean op was applied before translation,
+/// which is unsupported.
+async fn translate_addr_mask_to_row_ids(
+    dataset: &Dataset,
+    mask: NullableRowAddrMask,
+) -> Result<NullableRowAddrMask> {
+    match mask {
+        NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
+            translate_addr_set_to_row_ids(dataset, set).await?,
+        )),
+        NullableRowAddrMask::BlockList(_) => Err(Error::internal(
+            "cannot translate a block-list address mask to the row-id domain",
+        )),
+    }
+}
+
+async fn translate_addr_set_to_row_ids(
+    dataset: &Dataset,
+    set: NullableRowAddrSet,
+) -> Result<NullableRowAddrSet> {
+    let selected = translate_addr_treemap_to_row_ids(dataset, set.selected_rows()).await?;
+    let nulls = translate_addr_treemap_to_row_ids(dataset, set.null_rows()).await?;
+    Ok(NullableRowAddrSet::new(selected, nulls))
+}
+
+/// Map a set of physical row addresses to their stable row ids
+///
+/// For each fragment present in `addrs`, the live rows in physical order carry
+/// the stable ids yielded by the fragment's [`RowIdSequence`] in the same
+/// order. Zipping the two (skipping deleted physical offsets) gives the
+/// `physical offset -> stable id` mapping. Addresses that point at deleted rows
+/// have no live counterpart and are dropped, which is correct: those rows are
+/// not part of the answer.
+async fn translate_addr_treemap_to_row_ids(
+    dataset: &Dataset,
+    addrs: &RowAddrTreeMap,
+) -> Result<RowAddrTreeMap> {
+    let mut row_ids = RowAddrTreeMap::new();
+    for (fragment_id, selection) in addrs.iter() {
+        let file_fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
+            Error::internal(format!(
+                "fragment {fragment_id} referenced by an address-domain index result \
+                 was not found in the dataset"
+            ))
+        })?;
+        let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
+
+        match selection {
+            RowAddrSelection::Full => {
+                // The whole fragment is selected: every live row's id qualifies.
+                row_ids |= RowAddrTreeMap::from(sequence.as_ref());
+            }
+            RowAddrSelection::Partial(offsets) => {
+                let Some(max_offset) = offsets.max() else {
+                    continue;
+                };
+                let (deletion_vector, num_physical_rows) = futures::try_join!(
+                    file_fragment.get_deletion_vector(),
+                    file_fragment.physical_rows()
+                )?;
+                let num_physical_rows = num_physical_rows as u32;
+                let mut ids = sequence.iter();
+                for physical_offset in 0..num_physical_rows {
+                    if physical_offset > max_offset {
+                        break;
+                    }
+                    let deleted = deletion_vector
+                        .as_ref()
+                        .is_some_and(|dv| dv.contains(physical_offset));
+                    if deleted {
+                        continue;
+                    }
+                    match ids.next() {
+                        Some(id) => {
+                            if offsets.contains(physical_offset) {
+                                row_ids.insert(id);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+    Ok(row_ids)
 }
 
 /// An execution node that performs a scalar index search
@@ -105,7 +210,7 @@ impl ScalarIndexExec {
         ));
         Self {
             dataset,
-            expr,
+            expr: expr.optimize(),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
@@ -116,6 +221,7 @@ impl ScalarIndexExec {
         &self.dataset
     }
 
+    /// The parsed scalar-index expression this node will evaluate.
     pub fn expr(&self) -> &ScalarIndexExpr {
         &self.expr
     }
@@ -183,10 +289,6 @@ impl ExecutionPlan for ScalarIndexExec {
         "ScalarIndexExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.result_format.schema().clone()
     }
@@ -234,11 +336,11 @@ impl ExecutionPlan for ScalarIndexExec {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(datafusion::physical_plan::Statistics {
+    ) -> datafusion::error::Result<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(datafusion::physical_plan::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(2),
             ..datafusion::physical_plan::Statistics::new_unknown(self.result_format.schema())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -257,14 +359,40 @@ impl ExecutionPlan for ScalarIndexExec {
 pub static INDEX_LOOKUP_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
+/// A single scalar-index lookup used by [`MapIndexExec`].
+///
+/// `column` identifies a column whose values will be probed against the
+/// index named `index_name`. Multiple lookups are intersected with logical
+/// AND semantics inside `MapIndexExec`.
+#[derive(Debug, Clone)]
+pub struct IndexLookup {
+    pub column: String,
+    pub index_name: String,
+}
+
+impl IndexLookup {
+    pub fn new(column: impl Into<String>, index_name: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            index_name: index_name.into(),
+        }
+    }
+}
+
 /// An execution node that translates index values into row addresses
 ///
-/// This can be combined with TakeExec to perform an "indexed take"
+/// This can be combined with TakeExec to perform an "indexed take".
+///
+/// Multiple `(column, index_name)` lookups can be supplied: the operator
+/// expects one input column per lookup (in matching order) and emits the
+/// row addresses where every column's value is present in its respective
+/// index — that is, the AND of the per-column index probes. This lets a
+/// composite-key join trim the candidate row set with every available
+/// scalar index before the downstream take.
 #[derive(Debug)]
 pub struct MapIndexExec {
     dataset: Arc<Dataset>,
-    column_name: String,
-    index_name: String,
+    lookups: Vec<IndexLookup>,
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -276,19 +404,49 @@ impl DisplayAs for MapIndexExec {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
             | DisplayFormatType::TreeRender => {
-                write!(f, "IndexedLookup")
+                write!(f, "IndexedLookup")?;
+                if self.lookups.len() > 1 {
+                    let cols = self
+                        .lookups
+                        .iter()
+                        .map(|l| l.column.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(f, " [{cols}]")?;
+                }
+                Ok(())
             }
         }
     }
 }
 
 impl MapIndexExec {
+    /// Convenience constructor for the common single-column case.
     pub fn new(
         dataset: Arc<Dataset>,
         column_name: String,
         index_name: String,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
+        Self::new_multi(
+            dataset,
+            vec![IndexLookup::new(column_name, index_name)],
+            input,
+        )
+    }
+
+    /// Build a `MapIndexExec` that probes one or more scalar indices and
+    /// emits the AND of their results. `lookups` must be non-empty and
+    /// `input` must produce one column per lookup, in the same order.
+    pub fn new_multi(
+        dataset: Arc<Dataset>,
+        lookups: Vec<IndexLookup>,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        debug_assert!(
+            !lookups.is_empty(),
+            "MapIndexExec requires at least one index lookup"
+        );
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -297,8 +455,7 @@ impl MapIndexExec {
         ));
         Self {
             dataset,
-            column_name,
-            index_name,
+            lookups,
             input,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -309,24 +466,30 @@ impl MapIndexExec {
         input: datafusion::physical_plan::SendableRecordBatchStream,
         partition: usize,
         dataset: Arc<Dataset>,
-        column_name: String,
-        index_name: String,
+        lookups: Vec<IndexLookup>,
         index_metrics: Arc<IndexMetrics>,
         metrics_set: ExecutionPlanMetricsSet,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        // Time the one-shot setup (fragment bitmap + deletion mask) so it's
-        // attributed to this node's elapsed_compute. The helper itself only
-        // times per-batch work.
-        let elapsed_compute = datafusion::physical_plan::metrics::MetricBuilder::new(&metrics_set)
-            .elapsed_compute(partition);
-        let setup_start = std::time::Instant::now();
-        let fragment_bitmap = scalar_index_fragment_bitmap(&dataset, &column_name, &index_name)
-            .await?
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Internal(format!(
-                    "IndexedLookupExec: index '{index_name}' on column '{column_name}' disappeared after planning"
-                ))
-            })?;
+        // A row can be found by the composite probe only if it lives in a
+        // fragment covered by *every* index in `lookups`; restrict the
+        // deletion mask to that intersection so we only filter deletes we
+        // could actually see.
+        let mut fragment_bitmap: Option<RoaringBitmap> = None;
+        for lookup in &lookups {
+            let bm = scalar_index_fragment_bitmap(&dataset, &lookup.column, &lookup.index_name)
+                .await?
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "IndexedLookupExec: index '{}' on column '{}' disappeared after planning",
+                        lookup.index_name, lookup.column,
+                    ))
+                })?;
+            fragment_bitmap = Some(match fragment_bitmap {
+                None => bm,
+                Some(acc) => acc & bm,
+            });
+        }
+        let fragment_bitmap = fragment_bitmap.expect("MapIndexExec built with no lookups");
         let deletion_mask_fut =
             DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
         let deletion_mask = if let Some(fut) = deletion_mask_fut {
@@ -334,53 +497,73 @@ impl MapIndexExec {
         } else {
             None
         };
-        elapsed_compute.add_duration(setup_start.elapsed());
 
-        let helper = InstrumentedChildInputStream::new(
-            input,
+        let baseline = BaselineMetrics::new(&metrics_set, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
+        let stream = input.then(move |batch_result| {
+            let lookups = lookups.clone();
+            let dataset = dataset.clone();
+            let deletion_mask = deletion_mask.clone();
+            let metrics = index_metrics.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            async move {
+                let batch = batch_result?;
+                // Timer spans `map_batch`'s `.await` on purpose: that await is
+                // the per-batch sargable index evaluation, which is the work
+                // we want attributed here.
+                let _t = elapsed_compute.timer();
+                Self::map_batch(lookups, dataset, deletion_mask, batch, metrics).await
+            }
+        });
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
             INDEX_LOOKUP_SCHEMA.clone(),
-            move |batch| {
-                let column_name = column_name.clone();
-                let index_name = index_name.clone();
-                let dataset = dataset.clone();
-                let deletion_mask = deletion_mask.clone();
-                let metrics = index_metrics.clone();
-                Self::map_batch(
-                    column_name,
-                    index_name,
-                    dataset,
-                    deletion_mask,
-                    batch,
-                    metrics,
-                )
-            },
-            1,
-            partition,
-            &metrics_set,
-        );
-        Ok(Box::pin(helper))
+            stream,
+        )))
+    }
+
+    /// Build the AND-of-IsIn `ScalarIndexExpr` describing this batch's
+    /// composite lookup: each input column contributes one `IsIn` query
+    /// against its matching index.
+    fn build_query(
+        lookups: &[IndexLookup],
+        batch: &RecordBatch,
+    ) -> datafusion::error::Result<ScalarIndexExpr> {
+        let per_column = lookups.iter().enumerate().map(|(idx, lookup)| {
+            let column = batch.column(idx);
+            let values = (0..column.len())
+                .map(|row| ScalarValue::try_from_array(column, row))
+                .collect::<datafusion::error::Result<Vec<_>>>()?;
+            Ok::<_, datafusion::error::DataFusionError>(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: lookup.column.clone(),
+                index_name: lookup.index_name.clone(),
+                // Internal IndexedLookup-style query — type is unknown at this layer
+                index_type: String::new(),
+                query: Arc::new(SargableQuery::IsIn(values)),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            }))
+        });
+
+        per_column
+            .reduce(|lhs, rhs| Ok(ScalarIndexExpr::And(Box::new(lhs?), Box::new(rhs?))))
+            .expect("MapIndexExec built with no lookups")
     }
 
     async fn map_batch(
-        column_name: String,
-        index_name: String,
+        lookups: Vec<IndexLookup>,
         dataset: Arc<Dataset>,
         deletion_mask: Option<Arc<RowAddrMask>>,
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
-        let index_vals = batch.column(0);
-        let index_vals = (0..index_vals.len())
-            .map(|idx| ScalarValue::try_from_array(index_vals, idx))
-            .collect::<datafusion::error::Result<Vec<_>>>()?;
-        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
-            column: column_name,
-            index_name,
-            // Internal IndexedLookup-style query — type is unknown at this layer
-            index_type: String::new(),
-            query: Arc::new(SargableQuery::IsIn(index_vals)),
-            needs_recheck: false,
-        });
+        let query = Self::build_query(&lookups, &batch)?;
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         if !query_result.is_exact() {
             todo!("Support for non-exact query results as input for merge_insert")
@@ -409,10 +592,6 @@ impl ExecutionPlan for MapIndexExec {
         "MapIndexExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         INDEX_LOOKUP_SCHEMA.clone()
     }
@@ -430,10 +609,9 @@ impl ExecutionPlan for MapIndexExec {
                 "MapIndexExec requires exactly one child".to_string(),
             ))
         } else {
-            Ok(Arc::new(Self::new(
+            Ok(Arc::new(Self::new_multi(
                 self.dataset.clone(),
-                self.column_name.clone(),
-                self.index_name.clone(),
+                self.lookups.clone(),
                 children.into_iter().next().unwrap(),
             )))
         }
@@ -449,8 +627,7 @@ impl ExecutionPlan for MapIndexExec {
             input,
             partition,
             self.dataset.clone(),
-            self.column_name.clone(),
-            self.index_name.clone(),
+            self.lookups.clone(),
             Arc::new(IndexMetrics::new(&self.metrics, partition)),
             self.metrics.clone(),
         );
@@ -698,10 +875,6 @@ impl ExecutionPlan for MaterializeIndexExec {
         "MaterializeIndexExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         MATERIALIZE_INDEX_SCHEMA.clone()
     }
@@ -771,13 +944,15 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
+    use arrow::record_batch::RecordBatchIterator;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::Schema;
     use datafusion::{
         execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::gen_batch;
     use lance_index::{
         IndexType,
@@ -786,10 +961,11 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
-    use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{RowAddrTreeMap, result::IndexExprResultWireFormat};
 
     use crate::{
         Dataset,
+        dataset::WriteParams,
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
@@ -848,8 +1024,8 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
             needs_recheck: false,
+            fragment_bitmap: None,
         });
-
         let fragments = dataset.fragments().clone();
 
         let plan = MaterializeIndexExec::new(dataset, query, fragments);
@@ -868,6 +1044,51 @@ mod tests {
 
         assert_eq!(batches.len(), 10);
         assert_eq!(batches[0].num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_translate_addr_treemap_to_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..10).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+        let fragment_id = dataset.get_fragments()[1].id() as u32;
+
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(fragment_id);
+        let translated = super::translate_addr_treemap_to_row_ids(&dataset, &full_fragment)
+            .await
+            .unwrap();
+        let row_ids = translated
+            .get_fragment_bitmap(0)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![5, 6, 7, 8, 9]);
+
+        let mut partial_fragment = RowAddrTreeMap::new();
+        partial_fragment.insert(RowAddress::new_from_parts(fragment_id, 1).into());
+        partial_fragment.insert(RowAddress::new_from_parts(fragment_id, 3).into());
+        let translated = super::translate_addr_treemap_to_row_ids(&dataset, &partial_fragment)
+            .await
+            .unwrap();
+        let row_ids = translated
+            .get_fragment_bitmap(0)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![6, 8]);
     }
 
     /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise
@@ -892,6 +1113,7 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
             needs_recheck: false,
+            fragment_bitmap: None,
         });
 
         let verify = async |plan: ScalarIndexExec, schema: Arc<Schema>| {
@@ -943,6 +1165,7 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
             needs_recheck: false,
+            fragment_bitmap: None,
         });
 
         // These plans aren't even valid but it appears we defer all work (even validation) until

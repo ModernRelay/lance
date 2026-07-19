@@ -5,7 +5,6 @@
 //!
 //! Used in point lookup queries to skip generations that definitely don't contain the key.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,7 +20,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures::Stream;
-use lance_index::scalar::bloomfilter::sbbf::Sbbf;
+use lance_core::utils::bloomfilter::sbbf::Sbbf;
 
 /// Guards a child execution node with a bloom filter check.
 ///
@@ -132,10 +131,6 @@ impl DisplayAs for BloomFilterGuardExec {
 impl ExecutionPlan for BloomFilterGuardExec {
     fn name(&self) -> &str {
         "BloomFilterGuardExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

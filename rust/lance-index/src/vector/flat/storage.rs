@@ -17,7 +17,7 @@ use arrow_array::{
     types::{Float32Type, UInt64Type},
 };
 use arrow_schema::{DataType, SchemaRef};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::hamming::hamming;
@@ -38,7 +38,7 @@ pub struct FlatFloatStorage {
 }
 
 impl DeepSizeOf for FlatFloatStorage {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         self.batch.get_array_memory_size()
     }
 }
@@ -134,7 +134,7 @@ impl VectorStore for FlatFloatStorage {
 
     fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
         // TODO: use chunked storage
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch])?;
         let mut storage = self.clone();
         storage.row_ids = Arc::new(
             new_batch
@@ -200,7 +200,7 @@ pub struct FlatBinStorage {
 }
 
 impl DeepSizeOf for FlatBinStorage {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         self.batch.get_array_memory_size()
     }
 }
@@ -296,7 +296,7 @@ impl VectorStore for FlatBinStorage {
 
     fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
         // TODO: use chunked storage
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch])?;
         let mut storage = self.clone();
         storage.row_ids = Arc::new(
             new_batch

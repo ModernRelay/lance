@@ -108,6 +108,23 @@ def _commit_segmented_btree_index(dataset, column, index_name):
     return dataset.commit_existing_index_segments(index_name, column, segments)
 
 
+def test_create_scalar_index_rejects_invalid_uuid(tmp_path):
+    """Invalid UUID strings passed to create_scalar_index and merge_index_metadata
+    must surface as a Python ValueError at the FFI boundary."""
+    data = pa.table({"id": pa.array(range(100), type=pa.int64())})
+    dataset = lance.write_dataset(data, tmp_path / "ds")
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.create_scalar_index(
+            column="id",
+            index_type="BTREE",
+            index_uuid="not-a-uuid",
+        )
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.merge_index_metadata("also-not-a-uuid", index_type="BTREE")
+
+
 @pytest.fixture
 def btree_comparison_datasets(tmp_path):
     """Setup datasets for B-tree comparison tests"""
@@ -147,12 +164,160 @@ def btree_comparison_datasets(tmp_path):
     }
 
 
-def test_load_indices(indexed_dataset: lance.LanceDataset):
+def test_describe_indices_vector_and_scalar(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.describe_indices()
     vec_idx = next(idx for idx in indices if "VectorIndex" in idx.type_url)
     scalar_idx = next(idx for idx in indices if idx.index_type == "BTree")
     assert vec_idx is not None
     assert scalar_idx is not None
+
+
+def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
+    """Lock down the backwards-compatible shape of the deprecated list_indices().
+
+    list_indices() returns a list of plain dicts (one per index segment), not
+    Index dataclasses. This characterization test guards the dict keys and
+    values so the deprecated method stays backwards compatible.
+    """
+    with pytest.warns(DeprecationWarning):
+        indices = indexed_dataset.list_indices()
+
+    assert len(indices) == 2
+    by_name = {idx["name"]: idx for idx in indices}
+    assert set(by_name) == {"vector_idx", "meta_idx"}
+
+    expected_keys = {
+        "name",
+        "type",
+        "uuid",
+        "fields",
+        "version",
+        "fragment_ids",
+        "base_id",
+    }
+    for idx in indices:
+        assert set(idx) == expected_keys
+        assert isinstance(idx["uuid"], str) and len(idx["uuid"]) > 0
+        assert isinstance(idx["fields"], list)
+        assert isinstance(idx["fragment_ids"], set)
+        assert isinstance(idx["version"], int)
+        assert idx["type"] != "Unknown"
+        assert idx["base_id"] is None
+
+    vector_idx = by_name["vector_idx"]
+    assert vector_idx["type"] == "IVF_PQ"
+    assert vector_idx["fields"] == ["vector"]
+    assert vector_idx["fragment_ids"] == {0}
+
+    meta_idx = by_name["meta_idx"]
+    assert meta_idx["type"] == "BTree"
+    assert meta_idx["fields"] == ["meta"]
+    assert meta_idx["fragment_ids"] == {0}
+
+
+def test_list_indices_nested_field_path(tmp_path):
+    """list_indices() reports nested fields as full dotted paths."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("meta", pa.struct([pa.field("lang", pa.string())])),
+        ]
+    )
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "meta": [{"lang": "en"}, {"lang": "fr"}, {"lang": "en"}],
+        },
+        schema=schema,
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index(column="meta.lang", index_type="BTREE")
+
+    with pytest.warns(DeprecationWarning):
+        indices = ds.list_indices()
+
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["meta.lang"]
+
+
+def _commit_index(ds, index):
+    """Commit a single raw Index entry via the CreateIndex operation."""
+    return lance.LanceDataset.commit(
+        ds.uri,
+        lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+        read_version=ds.version,
+    )
+
+
+def test_list_indices_index_without_details(tmp_path):
+    """An index whose manifest entry has no index details (e.g. committed by an
+    older writer) is still reported on a best-effort basis: describe_indices()
+    does not error, and the type is reported as "Unknown"."""
+    from lance.dataset import Index
+
+    data = pa.table({"id": range(100), "val": range(100)})
+    ds = lance.write_dataset(data, tmp_path)
+
+    field_id = ds.schema.get_field_index("id")
+    fragment_ids = {f.fragment_id for f in ds.get_fragments()}
+    ds = _commit_index(
+        ds,
+        Index(
+            uuid=str(uuid.uuid4()),
+            name="legacy_idx",
+            fields=[field_id],
+            dataset_version=ds.version,
+            fragment_ids=fragment_ids,
+            index_version=0,
+        ),
+    )
+
+    described = ds.describe_indices()
+    assert len(described) == 1
+    assert described[0].name == "legacy_idx"
+    assert described[0].index_type == "Unknown"
+    assert described[0].type_url == ""
+
+    with pytest.warns(DeprecationWarning):
+        listed = ds.list_indices()
+    assert len(listed) == 1
+    assert listed[0]["name"] == "legacy_idx"
+    assert listed[0]["type"] == "Unknown"
+
+
+def test_list_indices_legacy_vector_index_without_details(tmp_path):
+    """A legacy vector index predates VectorIndexDetails: it has no index
+    details but stores a monolithic index file. Its type is recognized as
+    "Vector" from the index file rather than reported as "Unknown"."""
+    from lance.dataset import Index, IndexFile
+
+    data = pa.table({"id": range(100), "val": range(100)})
+    ds = lance.write_dataset(data, tmp_path)
+
+    field_id = ds.schema.get_field_index("id")
+    fragment_ids = {f.fragment_id for f in ds.get_fragments()}
+    ds = _commit_index(
+        ds,
+        Index(
+            uuid=str(uuid.uuid4()),
+            name="legacy_vector_idx",
+            fields=[field_id],
+            dataset_version=ds.version,
+            fragment_ids=fragment_ids,
+            index_version=0,
+            # "index.idx" is the legacy monolithic index file name; its presence
+            # is how a pre-details vector index is recognized.
+            files=[IndexFile(path="index.idx", size_bytes=0)],
+        ),
+    )
+
+    described = ds.describe_indices()
+    assert len(described) == 1
+    assert described[0].index_type == "Vector"
+
+    with pytest.warns(DeprecationWarning):
+        listed = ds.list_indices()
+    assert listed[0]["type"] == "Vector"
 
 
 def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa.Table):
@@ -483,7 +648,10 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     assert "ScalarIndexQuery" in plan
     assert "MaterializeIndex" not in plan
     assert "FlatMatchQuery" in plan
-    assert "LanceScan" in plan
+    # Flat FTS now reads via FilteredReadExec (prints as `LanceRead`) so the
+    # BTree on `id` pushes into the unindexed-fragment scan too.
+    assert "LanceRead" in plan
+    assert "LanceScan" not in plan
     assert make_fts_search(ds).to_table().num_rows == 12
 
     # Update vector index but NOT scalar index
@@ -703,6 +871,51 @@ def test_fts_custom_stop_words(tmp_path):
     assert len(results["_rowid"].to_pylist()) == 1
 
 
+def test_fts_stop_words_respect_language_for_simple_tokenizer(tmp_path):
+    data = pa.table({"text": ["the lance data", "的 lance data"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="simple",
+        stem=False,
+    )
+
+    results = ds.to_table(full_text_query="the", with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(full_text_query="的", with_row_id=True)
+    assert results["text"].to_pylist() == ["的 lance data"]
+
+
+def test_fts_icu_stop_words_are_all_or_none(tmp_path):
+    data = pa.table({"text": ["the 的 lance data", "useful data"]})
+    ds = lance.write_dataset(data, tmp_path / "enabled", mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=True,
+    )
+
+    assert ds.to_table(full_text_query="the", with_row_id=True).num_rows == 0
+    assert ds.to_table(full_text_query="的", with_row_id=True).num_rows == 0
+    assert ds.to_table(full_text_query="lance", with_row_id=True).num_rows == 1
+
+    ds = lance.write_dataset(data, tmp_path / "disabled", mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    assert ds.to_table(full_text_query="the", with_row_id=True).num_rows == 1
+    assert ds.to_table(full_text_query="的", with_row_id=True).num_rows == 1
+
+
 def test_rowid_order(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
     results = dataset.scanner(
@@ -734,6 +947,39 @@ def test_filter_with_fts_index(dataset):
 def test_create_scalar_index_fts_alias(dataset):
     dataset.create_scalar_index("doc", index_type="FTS", with_position=False)
     assert any(idx.index_type == "Inverted" for idx in dataset.describe_indices())
+
+
+def test_create_scalar_index_fts_block_size(dataset):
+    dataset.create_scalar_index(
+        "doc", index_type="INVERTED", with_position=False, block_size=256
+    )
+    indices = dataset.describe_indices()
+    doc_index = next(index for index in indices if index.name == "doc_idx")
+    assert doc_index.segments[0].index_version == 3
+
+    row = dataset.take(indices=[0], columns=["doc"])
+    query = row.column(0)[0].as_py().split(" ")[0]
+    results = dataset.scanner(columns=["doc"], full_text_query=query).to_table()
+    assert results.num_rows > 0
+
+    with pytest.raises(ValueError, match="block_size"):
+        dataset.create_scalar_index(
+            "doc", index_type="INVERTED", name="doc_invalid_129", block_size=129
+        )
+
+    with pytest.raises(ValueError, match="block_size"):
+        dataset.create_scalar_index(
+            "doc", index_type="INVERTED", name="doc_invalid_512", block_size=512
+        )
+
+    with pytest.raises(ValueError, match="block_size=256"):
+        dataset.create_scalar_index(
+            "doc",
+            index_type="INVERTED",
+            name="doc_invalid_v2_256",
+            block_size=256,
+            format_version=2,
+        )
 
 
 def test_multi_index_create(tmp_path):
@@ -1656,6 +1902,55 @@ def test_icu_tokenizer(tmp_path):
     assert results["_rowid"].to_pylist() == [0]
 
 
+def test_icu_tokenizer_split_on_non_alphanumeric_default(tmp_path):
+    data = pa.table({"text": ["hello_world"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    results = ds.to_table(full_text_query="hello", prefilter=True, with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(
+        full_text_query="hello_world", prefilter=True, with_row_id=True
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
+def test_icu_tokenizer_split_on_non_alphanumeric(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "hello_world こんにちは世界",
+                "alpha.beta",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu/split",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    for query, expected_row_ids in [
+        ("hello", [0]),
+        ("world", [0]),
+        ("世界", [0]),
+        ("alpha", [1]),
+        ("beta", [1]),
+    ]:
+        results = ds.to_table(full_text_query=query, prefilter=True, with_row_id=True)
+        assert results["_rowid"].to_pylist() == expected_row_ids
+
+
 def test_jieba_invalid_user_dict_tokenizer(tmp_path):
     set_language_model_path()
     data = pa.table(
@@ -1903,6 +2198,87 @@ def test_zonemap_zone_size(tmp_path: Path):
     assert small_bytes_read < large_bytes_read
 
 
+@pytest.mark.parametrize("index_type", ["ZONEMAP", "BLOOMFILTER"])
+def test_address_domain_index_with_stable_row_ids(tmp_path: Path, index_type):
+    """Regression test for issue #7434.
+
+    Address-domain scalar indices (zonemap, bloom filter) report matches as
+    physical row addresses. On a stable-row-id dataset a row's stable id differs
+    from its physical address in every fragment except fragment 0, so the index
+    result must be translated back to the row-id domain before it prefilters the
+    scan. Without that translation the index silently drops matching rows in
+    fragments other than fragment 0 (often returning an empty result).
+    """
+
+    # A single value "a" is placed in non-adjacent fragments (0, 2, 4) so its
+    # matching rows span multiple fragments and diverge from fragment 0.
+    def block(v, n):
+        return [v] * n
+
+    vals = (
+        block("a", 5_000)
+        + block("b", 5_000)
+        + block("a", 5_000)
+        + block("c", 5_000)
+        + block("a", 5_000)
+    )
+    tbl = pa.table({"category": pa.array(vals, pa.string()), "id": range(len(vals))})
+    ds = lance.write_dataset(
+        tbl, tmp_path, max_rows_per_file=5_000, enable_stable_row_ids=True
+    )
+    assert ds.has_stable_row_ids
+    assert len(ds.get_fragments()) == 5
+
+    true_count = ds.scanner(
+        filter="category = 'a'", use_scalar_index=False
+    ).count_rows()
+    assert true_count == 15_000
+
+    ds.create_scalar_index("category", index_type=index_type, replace=True)
+
+    # The index must be consulted and must return the same rows as a full scan.
+    assert "ScalarIndexQuery" in ds.scanner(filter="category = 'a'").explain_plan()
+    indexed = ds.to_table(filter="category = 'a'", columns=["id"])
+    assert indexed.num_rows == true_count
+    assert sorted(indexed["id"].to_pylist()) == sorted(
+        ds.to_table(filter="category = 'a'", columns=["id"], use_scalar_index=False)[
+            "id"
+        ].to_pylist()
+    )
+
+
+def test_zonemap_with_stable_row_ids_after_compaction(tmp_path: Path):
+    """Zonemap results stay correct after a compaction relocates rows under
+    stable row ids (physical address != stable id for the surviving rows)."""
+    ds = lance.write_dataset(
+        pa.table({"x": range(0, 5_000)}),
+        tmp_path,
+        max_rows_per_file=5_000,
+        enable_stable_row_ids=True,
+    )
+    ds = lance.write_dataset(
+        pa.table({"x": range(5_000, 10_000)}),
+        tmp_path,
+        mode="append",
+        max_rows_per_file=5_000,
+        enable_stable_row_ids=True,
+    )
+    # Delete part of the first fragment, then compact so surviving rows keep
+    # their small stable ids but move to a freshly numbered fragment.
+    ds.delete("x >= 1000 AND x < 2000")
+    ds.optimize.compact_files(target_rows_per_fragment=100_000)
+    ds = lance.dataset(tmp_path)
+    assert len(ds.get_fragments()) == 1
+
+    ds.create_scalar_index("x", index_type="ZONEMAP")
+
+    filter_expr = "x >= 6000 AND x <= 6500"
+    assert "ScalarIndexQuery" in ds.scanner(filter=filter_expr).explain_plan()
+    expected = ds.to_table(filter=filter_expr, use_scalar_index=False)["x"].to_pylist()
+    actual = ds.to_table(filter=filter_expr)["x"].to_pylist()
+    assert sorted(actual) == sorted(expected) == list(range(6000, 6501))
+
+
 def test_zonemap_deletion_handling(tmp_path: Path):
     """Test zonemap deletion handling"""
     data = pa.table(
@@ -1930,6 +2306,33 @@ def test_zonemap_deletion_handling(tmp_path: Path):
     assert ds.to_table(filter="value = False").num_rows == 0
     ids = ds.to_table(filter="value = True")["id"].to_pylist()
     assert ids == [0, 2, 4, 6, 8]
+
+
+@pytest.mark.parametrize("index_type", ["ZONEMAP", "BLOOMFILTER"])
+def test_address_domain_index_not_query_with_stable_row_ids(tmp_path: Path, index_type):
+    """Regression test: != queries return correct results on stable-row-id datasets.
+
+    Address-domain indices (zonemap, bloom filter) search returns physical row
+    addresses. Translation to row IDs happens at the Query leaf before the NOT
+    node is evaluated, so the NOT operates on a correctly translated AllowList.
+    Without the address-to-row-id translation the AllowList contains wrong IDs,
+    and the subsequent NOT excludes the wrong rows.
+    """
+    vals = list(range(5_000)) + list(range(5_000, 10_000))
+    tbl = pa.table({"x": vals})
+    ds = lance.write_dataset(
+        tbl, tmp_path, max_rows_per_file=5_000, enable_stable_row_ids=True
+    )
+    assert ds.has_stable_row_ids
+
+    ds.create_scalar_index("x", index_type=index_type, replace=True)
+
+    # Without address translation the NOT excludes the wrong rows, producing an
+    # incorrect result set rather than crashing.
+    expected = ds.to_table(filter="x != 42", use_scalar_index=False)["x"].to_pylist()
+    actual = ds.to_table(filter="x != 42")["x"].to_pylist()
+    assert sorted(actual) == sorted(expected)
+    assert len(actual) == 9_999
 
 
 def test_zonemap_index_remapping(tmp_path: Path):
@@ -2525,6 +2928,15 @@ def test_index_prewarm(tmp_path: Path):
 
     ds = lance.dataset(phrase_path)
     ds.prewarm_index("fts_idx", with_position=True)
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+    results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
+    assert results.num_rows == test_table_size
+    cache_entries_after_query = ds._ds.index_cache_entry_count()
+    assert cache_entries_after_query == cache_entries_after_prewarm
+
+    segment_uuid = ds.describe_indices()[0].segments[0].uuid
+    ds = lance.dataset(phrase_path)
+    ds.prewarm_index("fts_idx", with_position=True, index_segments=[segment_uuid])
     cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
     results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
     assert results.num_rows == test_table_size
@@ -3212,6 +3624,52 @@ def test_build_distributed_fts_index_basic(tmp_path):
     assert results.num_rows > 0, "No results found for search term 'frodo'"
 
 
+@pytest.mark.parametrize("index_type", ["INVERTED", "FTS"])
+def test_segment_fts(tmp_path, index_type):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    index_name = f"text_{index_type.lower()}_segment_idx"
+    segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type=index_type,
+            name=index_name,
+            fragment_ids=[fragment.fragment_id],
+            with_position=False,
+            remove_stop_words=False,
+        )
+        for fragment in ds.get_fragments()
+    ]
+    committed_ds = ds.commit_existing_index_segments(index_name, "text", segments)
+
+    query = MatchQuery("frodo", "text")
+    results_without_index = committed_ds.scanner(
+        full_text_query=query,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    results_with_index = committed_ds.scanner(
+        full_text_query=query,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+
+    compare_fts_results(results_without_index, results_with_index)
+    assert any(
+        idx.name == index_name and idx.index_type == "Inverted"
+        for idx in committed_ds.describe_indices()
+    )
+    assert (
+        "FlatMatchQuery"
+        not in committed_ds.scanner(
+            full_text_query=query,
+            use_scalar_index=True,
+        ).explain_plan()
+    )
+
+
 def test_compare_fts_results_identical(tmp_path):
     """
     Test compare_fts_results function with identical results.
@@ -3783,41 +4241,52 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
 
-def _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragment_ids):
-    ds.merge_index_metadata(index_id, index_type="BITMAP")
-
-    from lance.dataset import Index
-
-    field_id = ds.schema.get_field_index("category")
-    index = Index(
-        uuid=index_id,
-        name=index_name,
-        fields=[field_id],
-        dataset_version=ds.version,
-        fragment_ids=set(fragment_ids),
-        index_version=0,
+def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
+    dataset_path = tmp_path / "bitmap_segments.lance"
+    ds = generate_multi_fragment_bitmap_dataset(
+        dataset_path, num_fragments=4, rows_per_fragment=40
     )
-    create_index_op = lance.LanceOperation.CreateIndex(
-        new_indices=[index],
-        removed_indices=[],
-    )
-    lance.LanceDataset.commit(
-        ds.uri,
-        create_index_op,
-        read_version=ds.version,
-    )
-    reopened_ds = lance.dataset(ds.uri)
 
-    stats = reopened_ds.stats.index_stats(index_name)
-    assert stats["index_type"] == "Bitmap"
+    index_name = "bitmap_segment_idx"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    fragment_groups = [
+        fragment_ids[idx : idx + 2] for idx in range(0, len(fragment_ids), 2)
+    ]
+    assert len(fragment_groups) >= 2
+
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="category",
+            index_type="BITMAP",
+            name=index_name,
+            fragment_ids=fragment_group,
+        )
+        for fragment_group in fragment_groups
+    ]
+
+    assert len({segment.uuid for segment in staged_segments}) == len(staged_segments)
+    for segment, fragment_group in zip(staged_segments, fragment_groups):
+        assert segment.fragment_ids == set(fragment_group)
+        assert any(file.path == "bitmap_page_lookup.lance" for file in segment.files)
+        assert all(not file.path.startswith("part_") for file in segment.files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.uuid not in {segment.uuid for segment in staged_segments}
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "bitmap_page_lookup.lance" for file in merged_segment.files)
+    assert all(not file.path.startswith("part_") for file in merged_segment.files)
+
+    ds = ds.commit_existing_index_segments(index_name, "category", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert len(descriptions[index_name].segments) == 1
 
     filter_expr = "category = 3"
-    without_index = reopened_ds.scanner(
+    without_index = ds.scanner(
         filter=filter_expr,
         columns=["id", "category"],
         use_scalar_index=False,
     ).to_table()
-    with_index = reopened_ds.scanner(
+    with_index = ds.scanner(
         filter=filter_expr,
         columns=["id", "category"],
         use_scalar_index=True,
@@ -3826,77 +4295,83 @@ def _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragmen
     assert with_index.num_rows == without_index.num_rows
     assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
     assert set(with_index["category"].to_pylist()) == {3}
-
-    explain = reopened_ds.scanner(
-        filter=filter_expr,
-        use_scalar_index=True,
-    ).explain_plan()
-    assert "ScalarIndexQuery" in explain
-
-    empty_without_index = reopened_ds.scanner(
-        filter="category = 99",
-        use_scalar_index=False,
-    ).to_table()
-    empty_with_index = reopened_ds.scanner(
-        filter="category = 99",
-        use_scalar_index=True,
-    ).to_table()
-    assert empty_with_index.num_rows == empty_without_index.num_rows == 0
-
-
-def test_distributed_bitmap_index_build(tmp_path):
-    ds = generate_multi_fragment_bitmap_dataset(
-        tmp_path / "bitmap_dist.lance", num_fragments=4, rows_per_fragment=40
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
     )
 
-    index_id = str(uuid.uuid4())
-    index_name = "bitmap_multiple_fragment_idx"
-    fragments = ds.get_fragments()
-    fragment_ids = [fragment.fragment_id for fragment in fragments]
-    fragment_groups = [
-        fragment_ids[idx : idx + 2] for idx in range(0, len(fragment_ids), 2)
-    ]
-    assert len(fragment_groups) >= 2
 
-    for shard_id, fragment_group in enumerate(fragment_groups):
+def test_zonemap_fragment_ids_parameter_validation(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=100
+    )
+
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
         ds.create_scalar_index(
-            column="category",
-            index_type=IndexConfig(
-                index_type="bitmap",
-                parameters={"shard_id": shard_id},
-            ),
-            name=index_name,
-            replace=False,
-            index_uuid=index_id,
-            fragment_ids=fragment_group,
+            column="id",
+            index_type="ZONEMAP",
+            fragment_ids=[fragment_ids[0]],
         )
 
-    _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragment_ids)
 
-
-def test_distributed_bitmap_index_build_single_fragment_shards(tmp_path):
-    ds = generate_multi_fragment_bitmap_dataset(
-        tmp_path / "bitmap_single_fragment_dist.lance",
-        num_fragments=4,
-        rows_per_fragment=40,
+def test_zonemap_segment_merge_and_commit_from_python(tmp_path):
+    rows_per_fragment = 20_000
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=rows_per_fragment
     )
 
-    index_id = str(uuid.uuid4())
-    index_name = "bitmap_single_fragment_idx"
+    index_name = "id_zonemap_segments"
     fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
-    assert len(fragment_ids) >= 2
-
-    for fragment_id in fragment_ids:
-        ds.create_scalar_index(
-            column="category",
-            index_type="BITMAP",
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="id",
+            index_type="ZONEMAP",
             name=index_name,
-            replace=False,
-            index_uuid=index_id,
             fragment_ids=[fragment_id],
         )
+        for fragment_id in fragment_ids
+    ]
 
-    _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragment_ids)
+    assert len({segment.uuid for segment in staged_segments}) == len(staged_segments)
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        files = segment.files
+        assert files is not None
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "zonemap.lance" for file in files)
+        assert all(not file.path.startswith("part_") for file in files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    merged_files = merged_segment.files
+    assert merged_files is not None
+    assert merged_segment.uuid not in {segment.uuid for segment in staged_segments}
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "zonemap.lance" for file in merged_files)
+    assert all(not file.path.startswith("part_") for file in merged_files)
+
+    ds = ds.commit_existing_index_segments(index_name, "id", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "ZoneMap"
+    assert len(descriptions[index_name].segments) == 1
+
+    filter_expr = "id >= 8200 AND id < 8300"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+
+    assert with_index.num_rows == without_index.num_rows
+    assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
 
 
 def test_merge_index_metadata_btree_soft_break(tmp_path):
@@ -4243,7 +4718,7 @@ def test_nested_field_btree_index(tmp_path):
     # Verify index was created
     indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["lang"]
+    assert indices[0].field_names == ["meta.lang"]
     assert indices[0].index_type == "BTree"
 
     # Test query using the index - filter for English language
@@ -4344,7 +4819,7 @@ def test_nested_field_fts_index(tmp_path):
     # Verify index was created
     indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["text"]
+    assert indices[0].field_names == ["data.text"]
     assert indices[0].index_type == "Inverted"
 
     # Test full text search on nested field
@@ -4394,6 +4869,77 @@ def test_nested_field_fts_index(tmp_path):
     assert results.num_rows == 50
 
 
+def test_multiple_nested_field_fts_indices_e2e(tmp_path):
+    """Test FTS queries against multiple indexed nested string fields."""
+
+    def make_table(ids, text_values, summary_values):
+        return pa.table(
+            {
+                "id": ids,
+                "data": pa.StructArray.from_arrays(
+                    [
+                        pa.array(text_values, type=pa.string()),
+                        pa.array(summary_values, type=pa.string()),
+                    ],
+                    names=["text", "summary"],
+                ),
+            }
+        )
+
+    def result_ids(query):
+        return sorted(ds.to_table(full_text_query=query)["id"].to_pylist())
+
+    ds = lance.write_dataset(
+        make_table(
+            [0, 1, 2, 3],
+            [
+                "lance nested alpha",
+                "plain text",
+                None,
+                "phrase target here",
+            ],
+            [
+                "metadata only",
+                "database nested beta",
+                "lance beta",
+                "other",
+            ],
+        ),
+        tmp_path,
+    )
+
+    ds.create_scalar_index("data.text", index_type="INVERTED", with_position=True)
+    ds.create_scalar_index("data.summary", index_type="INVERTED", with_position=False)
+
+    indexed_fields = {
+        tuple(index.field_names)
+        for index in ds.describe_indices()
+        if index.index_type == "Inverted"
+    }
+    assert indexed_fields == {("data.text",), ("data.summary",)}
+
+    assert result_ids(MatchQuery("alpha", "data.text")) == [0]
+    assert result_ids(MatchQuery("beta", "data.summary")) == [1, 2]
+    assert result_ids("lance") == [0, 2]
+    assert result_ids(MultiMatchQuery("nested", ["data.text", "data.summary"])) == [
+        0,
+        1,
+    ]
+    assert result_ids(PhraseQuery("phrase target", "data.text")) == [3]
+
+    ds = lance.write_dataset(
+        make_table(
+            [4, 5],
+            ["fresh lance append", "plain append"],
+            ["other", "fresh beta append"],
+        ),
+        tmp_path,
+        mode="append",
+    )
+
+    assert result_ids("fresh") == [4, 5]
+
+
 def test_nested_field_bitmap_index(tmp_path):
     """Test BITMAP index creation and querying on nested fields"""
     # Create dataset with nested categorical field
@@ -4418,7 +4964,7 @@ def test_nested_field_bitmap_index(tmp_path):
     # Verify index was created
     indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["color"]
+    assert indices[0].field_names == ["attributes.color"]
     assert indices[0].index_type == "Bitmap"
 
     # Test equality query
@@ -4526,9 +5072,11 @@ def test_json_inverted_match_query(tmp_path):
     assert results.num_rows == 1
 
 
-@pytest.mark.parametrize("fts_format_version", ["1", "2"])
-def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
-    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", fts_format_version)
+@pytest.mark.parametrize(
+    ("format_version", "expected_format_version"),
+    [(1, 1), (2, 2), ("v1", 1), ("v2", 2)],
+)
+def test_describe_indices(tmp_path, format_version, expected_format_version):
     data = pa.table(
         {
             "id": range(100),
@@ -4544,7 +5092,7 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
         }
     )
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", index_type="INVERTED")
+    ds.create_scalar_index("text", index_type="INVERTED", format_version=format_version)
     indices = ds.describe_indices()
     assert len(indices) == 1
 
@@ -4558,7 +5106,7 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
     assert indices[0].segments[0].uuid is not None
     assert indices[0].segments[0].fragment_ids == {0}
     assert indices[0].segments[0].dataset_version_at_last_update == 1
-    assert indices[0].segments[0].index_version == int(fts_format_version)
+    assert indices[0].segments[0].index_version == expected_format_version
     assert indices[0].segments[0].created_at is not None
     assert isinstance(indices[0].segments[0].created_at, datetime)
     assert indices[0].segments[0].size_bytes is not None
@@ -4655,6 +5203,28 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
     indices = ds.describe_indices()
     for index in indices:
         assert index.num_rows_indexed == 50
+
+
+def test_create_inverted_index_defaults_to_v2_and_ignores_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", "1")
+    data = pa.table({"text": ["document about lance database"]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    ds.create_scalar_index("text", index_type="INVERTED")
+
+    indices = ds.describe_indices()
+    assert indices[0].segments[0].index_version == 2
+
+
+def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
+    data = pa.table({"text": ["document about lance database"]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported FTS format version"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
+
+    with pytest.raises(ValueError, match="format_version=3"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")
 
 
 def test_vector_filter_fts_search(tmp_path):
@@ -4774,3 +5344,28 @@ def test_vector_filter_fts_search(tmp_path):
     )
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "ZONEMAP"])
+def test_large_string_scalar_index(tmp_path, index_type):
+    """large_string (LargeUtf8) must be accepted by BTREE, BITMAP, and ZONEMAP."""
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int32()),
+            "category": pa.array(["alpha", "beta", "alpha"], pa.large_string()),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    assert ds.schema.field("category").type == pa.large_string()
+
+    # Must not raise TypeError
+    ds.create_scalar_index("category", index_type=index_type)
+
+    indices = ds.describe_indices()
+    assert any("category" in idx.field_names for idx in indices), (
+        f"{index_type} index for large_string column not found in describe_indices()"
+    )
+
+    result = ds.scanner(filter="category = 'alpha'").to_table()
+    assert result.num_rows == 2
+    assert set(result.column("id").to_pylist()) == {1, 3}

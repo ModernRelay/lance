@@ -3,6 +3,7 @@
 
 //! Extend [object_store::ObjectStore] functionalities
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::pin::Pin;
@@ -13,9 +14,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use deepsize::DeepSizeOf;
 use futures::{FutureExt, Stream};
 use futures::{StreamExt, TryStreamExt, future, stream::BoxStream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
@@ -25,7 +26,7 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -36,9 +37,11 @@ use super::local::LocalObjectReader;
 use crate::uring::{UringCurrentThreadReader, UringReader};
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) mod dynamic_credentials;
-#[cfg(any(feature = "oss", feature = "huggingface"))]
+#[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
 mod list_retry;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod providers;
 pub mod storage_options;
 #[cfg(test)]
@@ -61,7 +64,16 @@ pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
 const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+#[cfg(any(
+    feature = "aws",
+    feature = "gcp",
+    feature = "azure",
+    feature = "oss",
+    feature = "tencent",
+    feature = "huggingface",
+    feature = "tos",
+    feature = "goosefs",
+))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
 pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
@@ -74,8 +86,10 @@ pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
 pub use storage_options::{
-    EXPIRES_AT_MILLIS_KEY, LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY,
-    StorageOptionsAccessor, StorageOptionsProvider,
+    BASE_SCOPED_OPTION_PREFIX, BaseScopedStorageOptionsProvider, EXPIRES_AT_MILLIS_KEY,
+    LanceNamespaceStorageOptionsProvider, REFRESH_OFFSET_MILLIS_KEY, StorageOptionsAccessor,
+    StorageOptionsProvider, has_base_scoped_options, parse_base_scoped_key,
+    resolve_base_scoped_options,
 };
 
 #[async_trait]
@@ -145,7 +159,7 @@ pub struct ObjectStore {
 }
 
 impl DeepSizeOf for ObjectStore {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // We aren't counting `inner` here which is problematic but an ObjectStore
         // shouldn't be too big.  The only exception might be the write cache but, if
         // the writer cache has data, it means we're using it somewhere else that isn't
@@ -248,6 +262,27 @@ impl ObjectStoreParams {
         self.storage_options_accessor
             .as_ref()
             .and_then(|a| a.initial_storage_options())
+    }
+
+    /// Resolve these params for a single base path scope.
+    ///
+    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// apply only to one registered base path; see
+    /// [`StorageOptionsAccessor::scoped_to_base`]. Returns the params unchanged
+    /// when the storage options contain no base-scoped entries.
+    pub fn scoped_to_base(&self, base_id: Option<u32>) -> Cow<'_, Self> {
+        let Some(accessor) = &self.storage_options_accessor else {
+            return Cow::Borrowed(self);
+        };
+        let scoped = accessor.scoped_to_base(base_id);
+        if Arc::ptr_eq(&scoped, accessor) {
+            Cow::Borrowed(self)
+        } else {
+            Cow::Owned(Self {
+                storage_options_accessor: Some(scoped),
+                ..self.clone()
+            })
+        }
     }
 }
 
@@ -570,10 +605,17 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// The amount of parallelism to use for I/O operations.
+    ///
+    /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.
+    /// Always at least 1: callers feed this straight into `buffered` / `buffer_unordered`, and a
+    /// window of 0 makes those streams never poll their input — e.g. a metadata-only `count_rows`
+    /// would hang rather than return.
     pub fn io_parallelism(&self) -> usize {
         std::env::var("LANCE_IO_THREADS")
             .map(|val| val.parse::<usize>().unwrap())
             .unwrap_or(self.io_parallelism)
+            .max(1)
     }
 
     /// Get the IO tracker for this object store
@@ -830,8 +872,18 @@ impl ObjectStore {
             .common_prefixes
             .iter()
             .chain(output.objects.iter().map(|o| &o.location))
-            .map(|s| s.filename().unwrap().to_string())
+            .filter_map(|s| s.filename().map(|f| f.to_string()))
             .collect())
+    }
+
+    /// Non-recursive, path-segment delimited list of a single directory level.
+    ///
+    /// Unlike [`Self::list`], which recurses into the entire subtree, this returns
+    /// only the immediate children of `prefix`: the child "directories" as
+    /// [`ListResult::common_prefixes`] and the direct child files as
+    /// [`ListResult::objects`].
+    pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
     pub fn list(
@@ -1148,6 +1200,35 @@ mod tests {
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
+    }
+
+    #[test]
+    fn test_io_parallelism_clamped_to_nonzero() {
+        // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
+        // streams never poll, hanging callers (e.g. a metadata-only `count_rows`). It must clamp.
+        let store = ObjectStore::local();
+
+        // SAFETY: process-global env var, set and restored within this test. `io_parallelism()`
+        // only reads it, and a concurrent reader observes a valid clamped value, never 0.
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "0") };
+        assert_eq!(
+            store.io_parallelism(),
+            1,
+            "LANCE_IO_THREADS=0 must clamp to 1"
+        );
+
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "8") };
+        assert_eq!(
+            store.io_parallelism(),
+            8,
+            "a positive override must pass through unchanged"
+        );
+
+        unsafe { std::env::remove_var("LANCE_IO_THREADS") };
+        assert!(
+            store.io_parallelism() >= 1,
+            "the configured default parallelism must be at least 1"
+        );
     }
 
     #[tokio::test]

@@ -630,6 +630,9 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                 let config = ShardWriterConfig {
                                     shard_id,
                                     shard_spec_id: 0,
+                                    max_wal_persist_retries: 3,
+                                    wal_persist_retry_base_delay:
+                                        std::time::Duration::from_millis(50),
                                     durable_write: durable,
                                     sync_indexed_write: indexed,
                                     max_wal_buffer_size: max_wal_buffer_size
@@ -649,8 +652,12 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     backpressure_log_interval: default_config
                                         .backpressure_log_interval,
                                     stats_log_interval: default_config.stats_log_interval,
+                                    frozen_memtable_grace: default_config.frozen_memtable_grace,
                                     enable_memtable,
                                     hnsw_params: default_config.hnsw_params,
+                                    warmer: None,
+                                    store_params: default_config.store_params,
+                                    session: default_config.session,
                                 };
 
                                 // Get writer through Dataset API (index configs loaded automatically)

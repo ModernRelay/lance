@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BinaryHeap, HashMap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
 use crate::metrics::MetricsCollector;
@@ -106,7 +107,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     where
         Self: Sized;
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>, store: &impl VectorStore) -> Result<Self>
+    fn remap(&self, mapping: &RowAddrRemap, store: &impl VectorStore) -> Result<Self>
     where
         Self: Sized;
 

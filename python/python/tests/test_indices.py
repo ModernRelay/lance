@@ -8,7 +8,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.file import LanceFileReader
+from lance.file import LanceFileReader, LanceFileWriter
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 NUM_ROWS_PER_FRAGMENT = 10000
@@ -25,7 +25,7 @@ SMALL_NUM_ROWS = SMALL_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 
 def make_ds(num_rows: int, rows_per_frag: int, tmpdir: pathlib.Path, dtype: str):
     vectors = np.random.randn(num_rows, DIMENSION).astype(dtype)
-    vectors.shape = -1
+    vectors = vectors.reshape(-1)
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
     table = pa.Table.from_arrays([vectors], names=["vectors"])
     uri = str(tmpdir / "dataset")
@@ -53,7 +53,7 @@ def small_rand_dataset(tmpdir, request):
 @pytest.fixture
 def mostly_null_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(np.float32)
-    vectors.shape = -1
+    vectors = vectors.reshape(-1)
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
     vectors = vectors.to_pylist()
     vectors = [vec if i % 10 == 0 else None for i, vec in enumerate(vectors)]
@@ -209,6 +209,29 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     assert pq.dimension == reloaded.dimension
     assert pq.codebook == reloaded.codebook
 
+    pq_4bit = IndicesBuilder(rand_dataset, "vectors").train_pq(
+        rand_ivf,
+        sample_rate=2,
+        num_bits=4,
+    )
+    assert pq_4bit.num_bits == 4
+    assert len(pq_4bit.codebook) == 16
+
+    pq_4bit.save(str(tmpdir / "pq_4bit"))
+    reloaded = PqModel.load(str(tmpdir / "pq_4bit"))
+    assert reloaded.num_bits == 4
+
+    legacy_pq_uri = str(tmpdir / "legacy_pq")
+    with LanceFileWriter(
+        legacy_pq_uri,
+        pa.schema(
+            [pa.field("codebook", pq.codebook.type)],
+            metadata={b"num_subvectors": str(pq.num_subvectors).encode()},
+        ),
+    ) as writer:
+        writer.write_batch(pa.table([pq.codebook], names=["codebook"]))
+    assert PqModel.load(legacy_pq_uri).num_bits == 8
+
 
 def test_ivf_centroids_fragment_ids(tmpdir):
     rows_per_fragment = 32
@@ -219,7 +242,7 @@ def test_ivf_centroids_fragment_ids(tmpdir):
         ],
         axis=0,
     )
-    vectors.shape = -1
+    vectors = vectors.reshape(-1)
     table = pa.Table.from_arrays(
         [pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)], names=["vectors"]
     )
@@ -300,7 +323,7 @@ def test_indices_builder_multivector_distributed_dimensions(tmpdir, monkeypatch)
 
     captured_dimensions = {}
 
-    def train_pq_model(*args):
+    def train_pq_model(*args, **kwargs):
         captured_dimensions["train_pq"] = args[2]
         return codebook
 

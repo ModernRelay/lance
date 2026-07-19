@@ -798,6 +798,26 @@ pub trait CommitHandler: Debug + Send + Sync {
         default_resolve_version(base_path, version, object_store).await
     }
 
+    /// Check whether an attached manifest version exists without loading it.
+    ///
+    /// The default implementation probes the deterministic manifest path for
+    /// the given naming scheme. Commit handlers with an external source of
+    /// truth should override this method.
+    async fn version_exists(
+        &self,
+        base_path: &Path,
+        version: u64,
+        object_store: &dyn OSObjectStore,
+        naming_scheme: ManifestNamingScheme,
+    ) -> Result<bool> {
+        let path = naming_scheme.manifest_path(base_path, version);
+        match object_store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// List detached manifest locations.
     ///
     /// Returns a stream of detached manifest locations in arbitrary order.
@@ -1071,7 +1091,7 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "shared-memory" => {
+        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "tos" | "shared-memory" => {
             Ok(Arc::new(ConditionalPutCommitHandler))
         }
         #[cfg(not(feature = "dynamodb"))]
@@ -1946,19 +1966,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_handler_from_url_memory_schemes() {
-        // Both `memory://` and `shared-memory://` must route to
-        // ConditionalPutCommitHandler — otherwise concurrent writers fall
-        // through to UnsafeCommitHandler and silently clobber each other's
-        // manifests.
-        for url in ["memory://bucket-a/ds", "shared-memory://bucket-a/ds"] {
-            let handler = commit_handler_from_url(url, &None).await.unwrap();
-            assert_eq!(
-                format!("{:?}", handler),
-                "ConditionalPutCommitHandler",
-                "{url} should route to ConditionalPutCommitHandler",
-            );
-        }
+    #[rstest::rstest]
+    #[case::memory("memory://bucket-a/ds")]
+    #[case::shared_memory("shared-memory://bucket-a/ds")]
+    #[case::s3("s3://bucket-a/ds")]
+    #[case::gs("gs://bucket-a/ds")]
+    #[case::az("az://bucket-a/ds")]
+    #[case::abfss("abfss://bucket-a/ds")]
+    #[case::oss("oss://bucket-a/ds")]
+    #[case::cos("cos://bucket-a/ds")]
+    #[case::tos("tos://bucket-a/ds")]
+    async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
+        // Every scheme whose store supports atomic put-if-not-exists must
+        // route to ConditionalPutCommitHandler — otherwise concurrent writers
+        // fall through to UnsafeCommitHandler and silently clobber each
+        // other's manifests.
+        let handler = commit_handler_from_url(url, &None).await.unwrap();
+        assert_eq!(
+            format!("{:?}", handler),
+            "ConditionalPutCommitHandler",
+            "{url} should route to ConditionalPutCommitHandler",
+        );
     }
 
     /// A [CommitLock] whose lease records whether it was released, so we can

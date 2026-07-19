@@ -5,14 +5,14 @@
 //!
 //! Used as storage backend for Graph based algorithms.
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     cmp::min,
-    collections::HashMap,
     sync::{Arc, OnceLock},
 };
 
 use arrow::datatypes::{self, UInt8Type};
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
+use arrow_array::{ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_array::{
     FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
@@ -21,8 +21,8 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
@@ -70,10 +70,10 @@ pub struct ProductQuantizationMetadata {
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.codebook
             .as_ref()
-            .map(|codebook| codebook.get_array_memory_size())
+            .map(|codebook| (codebook as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
     }
 }
@@ -166,18 +166,20 @@ pub struct ProductQuantizationStorage {
 }
 
 impl DeepSizeOf for ProductQuantizationStorage {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.batch.deep_size_of_children(context)
             + self
                 .metadata
                 .codebook
                 .as_ref()
-                .map(|codebook| codebook.get_array_memory_size())
+                .map(|codebook| {
+                    (codebook as &dyn arrow_array::Array).deep_size_of_children(context)
+                })
                 .unwrap_or(0)
             + self
                 .pairwise_distance_table
                 .get()
-                .map(|table| table.deep_size_of_children(_context))
+                .map(|table| table.deep_size_of_children(context))
                 .unwrap_or(0)
     }
 }
@@ -219,7 +221,7 @@ impl ProductQuantizationStorage {
                 "Row ID column not found from PQ storage".to_string(),
             ));
         };
-        let row_ids: Arc<UInt64Array> = row_ids
+        let mut row_ids: Arc<UInt64Array> = row_ids
             .as_primitive_opt::<UInt64Type>()
             .ok_or(Error::index(
                 "Row ID column is not of type UInt64".to_string(),
@@ -291,6 +293,11 @@ impl ProductQuantizationStorage {
                 .as_primitive::<UInt8Type>()
                 .clone()
                 .into();
+            // Refresh the stored row ids from the remapped batch. Without this
+            // the storage keeps the pre-remap (compacted-away) addresses while
+            // its codes are remapped, so search returns stale row ids and the
+            // take fails with "fragment ... does not exist".
+            row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone().into();
         }
 
         let distance_type = match distance_type {
@@ -543,16 +550,16 @@ impl QuantizerStorage for ProductQuantizationStorage {
 
     // we can't use the default implementation of remap,
     // because PQ Storage transposed the PQ codes
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
         let transposed_codes = self.pq_code.values();
         let mut new_row_ids = Vec::with_capacity(self.len());
         let mut new_codes = Vec::with_capacity(self.len() * self.metadata.num_sub_vectors);
 
         let row_ids = self.row_ids.values();
         for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
+            match mapping.get(*row_id) {
                 Some(Some(new_id)) => {
-                    new_row_ids.push(*new_id);
+                    new_row_ids.push(new_id);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
                         self.metadata.nbits,
@@ -1147,6 +1154,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
     use rand::Rng;
+    use rstest::rstest;
 
     const DIM: usize = 32;
     const TOTAL: usize = 512;
@@ -1293,21 +1301,40 @@ mod tests {
         assert!((storage.dist_between(u, v) - expected).abs() < 1e-4);
     }
 
+    // The first half of the rows is rewritten in order into frag 1; the second
+    // half is deleted. remap must behave the same in either RowAddrRemap mode.
+    fn pq_remap_compact() -> RowAddrRemap {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        use roaring::RoaringTreemap;
+        RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter((0..TOTAL / 2).map(|i| i as u64)),
+            old_frag_ids: vec![0],
+            new_frags: vec![(1, (TOTAL / 2) as u32)],
+        }])
+        .unwrap()
+    }
+
+    fn pq_remap_explicit() -> RowAddrRemap {
+        RowAddrRemap::direct(
+            (0..TOTAL / 2)
+                .map(|i| (i as u64, Some((1u64 << 32) | i as u64)))
+                .chain((TOTAL / 2..TOTAL).map(|i| (i as u64, None)))
+                .collect(),
+        )
+    }
+
+    #[rstest]
+    #[case(pq_remap_compact())]
+    #[case(pq_remap_explicit())]
     #[tokio::test]
-    async fn test_remap_with_extra_column() {
+    async fn test_remap_with_extra_column(#[case] remap: RowAddrRemap) {
         let storage = create_pq_storage_with_extra_column().await;
-        let mut mapping = HashMap::new();
-        for i in 0..TOTAL / 2 {
-            mapping.insert(i as u64, Some((TOTAL + i) as u64));
-        }
-        for i in TOTAL / 2..TOTAL {
-            mapping.insert(i as u64, None);
-        }
-        let new_storage = storage.remap(&mapping).unwrap();
+        let new_storage = storage.remap(&remap).unwrap();
         assert_eq!(new_storage.len(), TOTAL / 2);
         assert_eq!(new_storage.row_ids.len(), TOTAL / 2);
         for (i, row_id) in new_storage.row_ids().enumerate() {
-            assert_eq!(*row_id, (TOTAL + i) as u64);
+            // Rewritten row i lands at offset i of frag 1.
+            assert_eq!(*row_id, (1u64 << 32) | i as u64);
         }
         assert_eq!(new_storage.batch.num_columns(), 2);
         assert!(new_storage.batch.column_by_name(ROW_ID).is_some());

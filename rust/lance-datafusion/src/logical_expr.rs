@@ -51,14 +51,10 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
                 field_path.push(c.name.as_str());
                 break;
             }
-            Expr::ScalarFunction(udf) => {
-                if udf.name() == GetFieldFunc::default().name() {
-                    let name = get_as_string_scalar_opt(&udf.args[1])?;
-                    field_path.push(name);
-                    current_expr = &udf.args[0];
-                } else {
-                    return None;
-                }
+            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
+                let name = get_as_string_scalar_opt(&udf.args[1])?;
+                field_path.push(name);
+                current_expr = &udf.args[0];
             }
             _ => return None,
         }
@@ -285,8 +281,10 @@ pub fn field_path_to_expr(field_path: &str) -> Result<Expr> {
         )));
     }
 
-    // Build the column expression, handling nested fields
-    let mut expr = col(&parts[0]);
+    // Build the column expression, handling nested fields.
+    let mut expr = Expr::Column(datafusion::common::Column::new_unqualified(
+        parts[0].clone(),
+    ));
     for part in &parts[1..] {
         expr = expr.field_newstyle(part);
     }
@@ -301,7 +299,25 @@ mod tests {
     use super::*;
 
     use arrow_schema::{Field, Schema as ArrowSchema};
+    use datafusion::common::Column;
     use datafusion_functions::core::expr_ext::FieldAccessor;
+
+    #[test]
+    fn test_field_path_to_expr_preserves_case_sensitive_root_column() {
+        let expr = field_path_to_expr("VECTOR").unwrap();
+
+        assert_eq!(expr, Expr::Column(Column::new_unqualified("VECTOR")));
+    }
+
+    #[test]
+    fn test_field_path_to_expr_preserves_case_sensitive_escaped_nested_path() {
+        let expr = field_path_to_expr("Parent.`Child.With.Dot`").unwrap();
+
+        assert_eq!(
+            expr,
+            Expr::Column(Column::new_unqualified("Parent")).field_newstyle("Child.With.Dot")
+        );
+    }
 
     #[test]
     fn test_resolve_large_utf8() {
@@ -462,5 +478,59 @@ mod tests {
             }
             _ => unreachable!("Expected BinaryExpr"),
         }
+    }
+
+    #[test]
+    fn test_resolve_typed_null_against_dictionary_column() {
+        // A dictionary-encoded string column, e.g. a categorical field.
+        let dict_ty = DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8));
+        let arrow_schema = ArrowSchema::new(vec![Field::new("etld", dict_ty, true)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // A typed null must be wrapped in the dictionary type, not left as a bare
+        // `Utf8(None)` literal sitting next to a `Dictionary(...)` column.
+        let expected_null = Expr::Literal(
+            ScalarValue::Dictionary(Box::new(DataType::Int16), Box::new(ScalarValue::Utf8(None))),
+            None,
+        );
+
+        // `etld = <typed null>` built directly via the API, as opposed to coming
+        // through SQL parsing.
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column("etld".to_string().into())),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Utf8(None), None)),
+        });
+        match resolve_expr(&expr, &schema).unwrap() {
+            Expr::BinaryExpr(be) => assert_eq!(be.right.as_ref(), &expected_null),
+            other => unreachable!("Expected BinaryExpr, got {other:?}"),
+        }
+
+        // `etld IN ('a', <typed null>)` — a typed value mixed with a typed null,
+        // both already typed as Utf8. Every list element is wrapped in the
+        // dictionary type.
+        let expr = Expr::in_list(
+            Expr::Column("etld".to_string().into()),
+            vec![
+                Expr::Literal(ScalarValue::Utf8(Some("a".to_string())), None),
+                Expr::Literal(ScalarValue::Utf8(None), None),
+            ],
+            false,
+        );
+        let expected = Expr::in_list(
+            Expr::Column("etld".to_string().into()),
+            vec![
+                Expr::Literal(
+                    ScalarValue::Dictionary(
+                        Box::new(DataType::Int16),
+                        Box::new(ScalarValue::Utf8(Some("a".to_string()))),
+                    ),
+                    None,
+                ),
+                expected_null,
+            ],
+            false,
+        );
+        assert_eq!(resolve_expr(&expr, &schema).unwrap(), expected);
     }
 }

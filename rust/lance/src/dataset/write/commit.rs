@@ -104,6 +104,10 @@ impl<'a> CommitBuilder<'a> {
     }
 
     /// Pass a commit handler to use for the dataset.
+    ///
+    /// Takes precedence over the destination dataset's own handler. If not
+    /// set, a `Dataset` destination commits through its own handler and a
+    /// `Uri` destination resolves one from the uri.
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
         self.commit_handler = Some(commit_handler);
         self
@@ -241,7 +245,9 @@ impl<'a> CommitBuilder<'a> {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
-                dataset.commit_handler.clone(),
+                self.commit_handler
+                    .clone()
+                    .unwrap_or_else(|| dataset.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
                 let commit_handler = if let (Some(_), Some(commit_handler)) =
@@ -339,7 +345,6 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
-
         // Validate storage format matches existing dataset
         if let Some(ds) = dest.dataset()
             && let Some(storage_format) = self.storage_format
@@ -497,7 +502,6 @@ impl<'a> CommitBuilder<'a> {
             },
             read_version,
             tag: None,
-            //TODO: handle batch transaction merges in the future
             transaction_properties: None,
         };
         let dataset = self.execute(merged.clone()).await?;
@@ -545,6 +549,7 @@ mod tests {
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
             }],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(10),
@@ -624,10 +629,12 @@ mod tests {
             .unwrap();
         assert_eq!(new_ds.manifest().version, 7);
         // Session should still be re-used
-        // However, the dataset needs to be loaded and the read version checked out,
-        // so an additional 4 IOPs are needed.
+        // However, the dataset needs to be loaded and the read version checked out.
+        // The read version's manifest body is served from the session cache (it
+        // was cached when v1 was first created), so the checkout only pays the
+        // version-resolution head, not a manifest read.
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-        assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
+        assert_io_eq!(io_stats, read_iops, 3, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
         // Commit transaction with URI and new session. Re-use the store

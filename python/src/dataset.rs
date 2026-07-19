@@ -20,10 +20,11 @@ use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
+use pyo3::types::{PyBytes, PyInt, PyList, PyString, PyTuple};
 use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3::{
     PyResult,
@@ -36,7 +37,7 @@ use pyo3::{
 use uuid::Uuid;
 
 use lance::dataset::AutoCleanupParams;
-use lance::dataset::cleanup::CleanupPolicyBuilder;
+use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
@@ -69,6 +70,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
@@ -76,14 +78,13 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
+    scalar::inverted::InvertedListFormatVersion,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        DEFAULT_QUERY_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
-        ivf::IvfBuildParams, pq::PQBuildParams, sq::builder::SQBuildParams,
+        ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+        sq::builder::SQBuildParams,
     },
-};
-use lance_index::{
-    infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
@@ -107,7 +108,9 @@ use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
-use self::cleanup::CleanupStats;
+use self::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+};
 use self::commit::PyCommitLock;
 use self::io_stats::IoStats;
 
@@ -393,6 +396,23 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn target_bases(
+        mut slf: PyRefMut<'_, Self>,
+        bases: Vec<String>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_base_names_or_paths(bases);
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (include_primary = true))]
+    pub fn target_all_bases(
+        mut slf: PyRefMut<'_, Self>,
+        include_primary: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_all_bases(include_primary);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -527,6 +547,23 @@ fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegm
         }
     }
     Ok(extracted)
+}
+
+fn parse_index_segment_ids(index_segments: Option<Vec<String>>) -> PyResult<Option<Vec<Uuid>>> {
+    index_segments
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| {
+                    Uuid::parse_str(&segment).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "invalid index segment uuid '{segment}': {err}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
 }
 
 impl MergeInsertBuilder {
@@ -684,6 +721,89 @@ pub struct Dataset {
     pub(crate) ds: Arc<LanceDataset>,
 }
 
+impl Dataset {
+    async fn cleanup_policy(
+        &self,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
+        delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+    ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
+        let mut builder = CleanupPolicyBuilder::default();
+        if let Some(v) = older_than_micros {
+            let older_than = Duration::microseconds(v);
+            builder = builder.before_timestamp(Utc::now() - older_than);
+        }
+        if let Some(v) = retain_versions {
+            builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
+        }
+        if let Some(v) = delete_unverified {
+            builder = builder.delete_unverified(v);
+        }
+        if let Some(v) = error_if_tagged_old_versions {
+            builder = builder.error_if_tagged_old_versions(v);
+        }
+        if let Some(v) = delete_rate_limit {
+            builder = builder.delete_rate_limit(v)?;
+        }
+        Ok(builder.build())
+    }
+}
+
+fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
+    CleanupStats {
+        bytes_removed: stats.bytes_removed,
+        old_versions: stats.old_versions,
+        data_files_removed: stats.data_files_removed,
+        transaction_files_removed: stats.transaction_files_removed,
+        index_files_removed: stats.index_files_removed,
+        deletion_files_removed: stats.deletion_files_removed,
+    }
+}
+
+fn cleanup_file_kind(kind: CleanupFileKind) -> &'static str {
+    match kind {
+        CleanupFileKind::Manifest => "manifest",
+        CleanupFileKind::Data => "data",
+        CleanupFileKind::Transaction => "transaction",
+        CleanupFileKind::Index => "index",
+        CleanupFileKind::Deletion => "deletion",
+        CleanupFileKind::TemporaryManifest => "temporary_manifest",
+    }
+}
+
+fn cleanup_explanation(
+    explanation: lance::dataset::cleanup::CleanupExplanation,
+) -> CleanupExplanation {
+    CleanupExplanation {
+        read_version: explanation.read_version,
+        stats: cleanup_stats(explanation.stats),
+        candidate_files: explanation
+            .candidate_files
+            .into_iter()
+            .map(|file| CleanupCandidateFile {
+                path: file.path,
+                kind: cleanup_file_kind(file.kind).to_string(),
+                unverified: file.unverified,
+                size_bytes: file.size_bytes,
+            })
+            .collect(),
+        candidate_files_truncated: explanation.candidate_files_truncated,
+        candidate_file_limit: explanation.candidate_file_limit,
+        referenced_branches: explanation
+            .referenced_branches
+            .into_iter()
+            .map(|branch| CleanupReferencedBranch {
+                name: branch.name,
+                referenced_version: branch.referenced_version,
+                cleanup_candidate: branch.cleanup_candidate,
+            })
+            .collect(),
+        warnings: explanation.warnings,
+    }
+}
+
 #[pymethods]
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
@@ -820,8 +940,14 @@ impl Dataset {
 
             // Set up commit handler only if namespace manages versioning
             if namespace_client_managed_versioning {
-                let external_store =
-                    LanceNamespaceExternalManifestStore::new(ns_client, tid.clone());
+                // The store derives the branch a request targets from the base
+                // path it is handed, resolved against the table root.
+                let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                    ns_client,
+                    tid.clone(),
+                    &uri,
+                )
+                .infer_error()?;
                 let commit_handler: Arc<dyn CommitHandler> =
                     Arc::new(ExternalManifestCommitHandler {
                         external_manifest_store: Arc::new(external_store),
@@ -932,6 +1058,32 @@ impl Dataset {
             })
     }
 
+    /// Remap row addresses across compactions still recorded in the
+    /// fragment-reuse index. Rows a compaction dropped become null. The index
+    /// retains only recent rounds (older ones are pruned as index remap catches
+    /// up), so remap promptly: an address whose round was pruned is returned
+    /// unchanged, not remapped. Returns None when there is no fragment-reuse
+    /// index.
+    fn remap_row_addrs(
+        &self,
+        py: Python,
+        addrs: PyArrowType<ArrayData>,
+    ) -> PyResult<Option<PyArrowType<ArrayData>>> {
+        use lance_index::metrics::NoOpMetricsCollector;
+
+        let array = make_array(addrs.0);
+        let frag_reuse_index = rt()
+            .block_on(
+                Some(py),
+                self.ds.open_frag_reuse_index(&NoOpMetricsCollector),
+            )?
+            .map_err(|err| {
+                PyIOError::new_err(format!("failed to open fragment reuse index: {err}"))
+            })?;
+
+        Ok(frag_reuse_index.map(|fri| PyArrowType(fri.remap_row_ids_array(array).to_data())))
+    }
+
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
         let manifest_bytes = self.ds.manifest().serialized();
         PyBytes::new(py, &manifest_bytes).into()
@@ -950,79 +1102,6 @@ impl Dataset {
         }
 
         Ok(dict.into())
-    }
-
-    /// Load index metadata.
-    ///
-    /// This call will open the index and return its concrete index type.
-    fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
-        let index_metadata = rt()
-            .block_on(Some(self_.py()), self_.ds.load_indices())?
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        let py = self_.py();
-        index_metadata
-            .iter()
-            .map(|idx| {
-                let dict = PyDict::new(py);
-                let schema = self_.ds.schema();
-                let field_paths = idx
-                    .fields
-                    .iter()
-                    .map(|field_id| schema.field_path(*field_id).unwrap())
-                    .collect::<Vec<_>>();
-
-                let ds = self_.ds.clone();
-                let idx_type = match rt().block_on(Some(self_.py()), async {
-                    if let Some(system_index_type) = infer_system_index_type(idx) {
-                        Ok::<_, lance::Error>(system_index_type.to_string())
-                    } else {
-                        let idx = ds
-                            .open_generic_index(
-                                &field_paths[0],
-                                &idx.uuid.to_string(),
-                                &NoOpMetricsCollector,
-                            )
-                            .await?;
-                        Ok::<_, lance::Error>(idx.index_type().to_string())
-                    }
-                })? {
-                    Ok(r) => r,
-                    Err(error) => {
-                        log::warn!(
-                            "Cannot derive index type for index {} (uuid={}, type_url={:?}, version={}) on dataset {}: {}",
-                            idx.name,
-                            idx.uuid,
-                            idx.index_details.as_ref().map(|d| d.type_url.as_str()),
-                            idx.index_version,
-                            self_.ds.uri(),
-                            error,
-                        );
-                        // mark the type as unknown for any new index type
-                        "Unknown".to_owned()
-                    }
-                };
-
-                let fragment_set = PySet::empty(py).unwrap();
-                if let Some(bitmap) = &idx.fragment_bitmap {
-                    for fragment_id in bitmap.iter() {
-                        fragment_set.add(fragment_id).unwrap();
-                    }
-                }
-
-                dict.set_item("name", idx.name.clone()).unwrap();
-                // TODO: once we add more than vector indices, we need to:
-                // 1. Change protos and write path to persist index type
-                // 2. Use the new field from idx instead of hard coding it to Vector
-                dict.set_item("type", idx_type).unwrap();
-                dict.set_item("uuid", idx.uuid.to_string()).unwrap();
-                dict.set_item("fields", field_paths).unwrap();
-                dict.set_item("version", idx.dataset_version).unwrap();
-                dict.set_item("fragment_ids", fragment_set).unwrap();
-                dict.set_item("base_id", idx.base_id.map(|id| id as i64))
-                    .unwrap();
-                dict.into_py_any(py)
-            })
-            .collect::<PyResult<Vec<_>>>()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1303,6 +1382,7 @@ impl Dataset {
                 use_index,
                 ef,
                 query_parallelism,
+                approx_mode,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1369,6 +1449,7 @@ impl Dataset {
                         s = s.ef(ef);
                     }
                     s = s.query_parallelism(query_parallelism);
+                    s = s.approx_mode(approx_mode);
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
@@ -1927,37 +2008,61 @@ impl Dataset {
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
     ) -> PyResult<CleanupStats> {
-        let cleanup_stats = rt()
+        let stats = rt()
             .block_on(None, async {
-                let mut builder = CleanupPolicyBuilder::default();
-                if let Some(v) = older_than_micros {
-                    let older_than = Duration::microseconds(v);
-                    builder = builder.before_timestamp(Utc::now() - older_than);
-                }
-                if let Some(v) = retain_versions {
-                    builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
-                }
-                if let Some(v) = delete_unverified {
-                    builder = builder.delete_unverified(v);
-                }
-                if let Some(v) = error_if_tagged_old_versions {
-                    builder = builder.error_if_tagged_old_versions(v);
-                }
-                if let Some(v) = delete_rate_limit {
-                    builder = builder.delete_rate_limit(v)?;
-                }
-
-                self.ds.cleanup_with_policy(builder.build()).await
+                let policy = self
+                    .cleanup_policy(
+                        older_than_micros,
+                        retain_versions,
+                        delete_unverified,
+                        error_if_tagged_old_versions,
+                        delete_rate_limit,
+                    )
+                    .await?;
+                self.ds.cleanup_with_policy(policy).await
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        Ok(CleanupStats {
-            bytes_removed: cleanup_stats.bytes_removed,
-            old_versions: cleanup_stats.old_versions,
-            data_files_removed: cleanup_stats.data_files_removed,
-            transaction_files_removed: cleanup_stats.transaction_files_removed,
-            index_files_removed: cleanup_stats.index_files_removed,
-            deletion_files_removed: cleanup_stats.deletion_files_removed,
-        })
+        Ok(cleanup_stats(stats))
+    }
+
+    /// Explain cleanup old versions from the dataset without deleting files
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, include_files = false, max_files = 1000))]
+    fn explain_cleanup_old_versions(
+        &self,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
+        delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+        include_files: bool,
+        max_files: usize,
+    ) -> PyResult<CleanupExplanation> {
+        let explanation = rt()
+            .block_on(None, async {
+                let policy = self
+                    .cleanup_policy(
+                        older_than_micros,
+                        retain_versions,
+                        delete_unverified,
+                        error_if_tagged_old_versions,
+                        delete_rate_limit,
+                    )
+                    .await?;
+                self.ds
+                    .cleanup(policy)
+                    .with_max_candidate_files(max_files)
+                    .explain()
+                    .await
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let mut explanation = cleanup_explanation(explanation);
+        if !include_files {
+            explanation.candidate_files.clear();
+            explanation.candidate_files_truncated = false;
+            explanation.warnings.clear();
+        }
+        Ok(explanation)
     }
 
     fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<Py<PyAny>> {
@@ -2235,6 +2340,7 @@ impl Dataset {
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
+            "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -2274,6 +2380,27 @@ impl Dataset {
                 index_type: "rtree".to_string(),
                 params: None,
             }),
+            "FM" => {
+                let mut params_json = serde_json::Map::new();
+                if let Some(kwargs) = kwargs
+                    && let Some(num_segments) = kwargs.get_item("num_segments")?
+                {
+                    let n: u32 = num_segments.extract()?;
+                    params_json.insert(
+                        "num_segments".to_string(),
+                        serde_json::Value::Number(n.into()),
+                    );
+                }
+                let params = if params_json.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(params_json).to_string())
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "fm".to_string(),
+                    params,
+                })
+            }
             "SCALAR" => {
                 let Some(kwargs) = kwargs else {
                     return Err(PyValueError::new_err(
@@ -2337,11 +2464,33 @@ impl Dataset {
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
+                    if let Some(block_size) = kwargs.get_item("block_size")? {
+                        params = params
+                            .block_size(block_size.extract()?)
+                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);
                     }
                     if let Some(num_workers) = kwargs.get_item("num_workers")? {
                         params = params.num_workers(num_workers.extract()?);
+                    }
+                    if let Some(format_version) = kwargs.get_item("format_version")?
+                        && !format_version.is_none()
+                    {
+                        let value = if let Ok(value) = format_version.cast::<PyString>() {
+                            value.to_string_lossy().to_string()
+                        } else if let Ok(value) = format_version.extract::<u32>() {
+                            value.to_string()
+                        } else {
+                            return Err(PyValueError::new_err(
+                                "format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'",
+                            ));
+                        };
+                        let format_version = value
+                            .parse::<InvertedListFormatVersion>()
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                        params = params.format_version(format_version);
                     }
                 }
                 Box::new(params)
@@ -2380,10 +2529,22 @@ impl Dataset {
             None
         };
 
-        let index_uuid: Option<String> = if let Some(kwargs) = kwargs {
+        let index_uuid: Option<Uuid> = if let Some(kwargs) = kwargs {
             kwargs
                 .get_item("index_uuid")?
-                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .and_then(|v| {
+                    if v.is_none() {
+                        None
+                    } else {
+                        Some(v.extract::<String>())
+                    }
+                })
+                .transpose()?
+                .map(|s| {
+                    Uuid::parse_str(&s).map_err(|e| {
+                        PyValueError::new_err(format!("Invalid UUID string for index_uuid: {e}"))
+                    })
+                })
                 .transpose()?
         } else {
             None
@@ -2461,18 +2622,31 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (name, *, with_position = false))]
-    fn prewarm_index(&self, name: &str, with_position: bool) -> PyResult<()> {
+    #[pyo3(signature = (name, *, with_position = false, index_segments = None))]
+    fn prewarm_index(
+        &self,
+        name: &str,
+        with_position: bool,
+        index_segments: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let index_segments = parse_index_segment_ids(index_segments)?;
+
         rt().block_on(None, async {
             if with_position {
-                self.ds
-                    .prewarm_index_with_options(
-                        name,
-                        &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
-                    )
-                    .await
+                let options = PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true));
+                if let Some(index_segments) = index_segments.as_deref() {
+                    self.ds
+                        .prewarm_index_segments_with_options(name, index_segments, &options)
+                        .await
+                } else {
+                    self.ds.prewarm_index_with_options(name, &options).await
+                }
             } else {
-                self.ds.prewarm_index(name).await
+                if let Some(index_segments) = index_segments.as_deref() {
+                    self.ds.prewarm_index_segments(name, index_segments).await
+                } else {
+                    self.ds.prewarm_index(name).await
+                }
             }
         })?
         .infer_error()
@@ -2486,6 +2660,9 @@ impl Dataset {
         batch_readhead: Option<usize>,
         progress_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let parsed_uuid = Uuid::parse_str(index_uuid).map_err(|e| {
+            PyValueError::new_err(format!("Invalid UUID string for index_uuid: {e}"))
+        })?;
         let mut progress_handler =
             Self::make_index_progress_handler_from_callback(progress_callback)?;
         let progress: Arc<dyn IndexBuildProgress> = progress_handler
@@ -2497,7 +2674,7 @@ impl Dataset {
             async {
                 self.ds
                     .merge_index_metadata(
-                        index_uuid,
+                        &parsed_uuid,
                         IndexType::try_from(index_type)?,
                         batch_readhead,
                         progress,
@@ -2691,9 +2868,16 @@ impl Dataset {
                 && let (Some(ns_client), Some(tid)) = (namespace_client, table_id)
             {
                 // Create ExternalManifestCommitHandler from namespace client and table_id
-                // only when namespace manages versioning
+                // only when namespace manages versioning. The store derives the
+                // branch a request targets from the base path it is handed,
+                // resolved against the table root.
                 let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
-                let external_store = LanceNamespaceExternalManifestStore::new(ns_client, tid);
+                let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                    ns_client,
+                    tid,
+                    &dest.table_root_uri()?,
+                )
+                .infer_error()?;
                 Some(Arc::new(ExternalManifestCommitHandler {
                     external_manifest_store: Arc::new(external_store),
                 }) as Arc<dyn CommitHandler>)
@@ -2909,6 +3093,54 @@ impl Dataset {
         Ok(PyArrowType(reader))
     }
 
+    #[pyo3(signature = (*, min_version=None, progress=None))]
+    fn tracked_files(
+        &self,
+        min_version: Option<u64>,
+        progress: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::dataset::files::{TrackedFilesOptions, TrackedFilesProgress};
+
+        let progress_cb: Option<Box<dyn Fn(TrackedFilesProgress) + Send + Sync>> =
+            if let Some(cb) = progress {
+                if !cb.is_callable() {
+                    return Err(PyValueError::new_err("progress must be callable"));
+                }
+                let cb = cb.clone().unbind();
+                Some(Box::new(move |p: TrackedFilesProgress| {
+                    Python::attach(|py| {
+                        let total: Option<usize> = p.manifests_total;
+                        match cb.call1(py, (p.manifests_processed, total)) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                log::error!("Error in tracked_files progress callback: {}", e);
+                            }
+                        }
+                    });
+                }))
+            } else {
+                None
+            };
+
+        let options = TrackedFilesOptions {
+            min_version,
+            progress: progress_cb,
+        };
+        let stream = rt().block_on(None, self.ds.tracked_files_with_options(options))?;
+        let reader = Box::new(LanceReader::from_stream(DatasetRecordBatchStream::new(
+            stream,
+        )));
+        Ok(PyArrowType(reader))
+    }
+
+    fn all_files(&self) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let stream = rt().block_on(None, self.ds.all_files())?;
+        let reader = Box::new(LanceReader::from_stream(DatasetRecordBatchStream::new(
+            stream,
+        )));
+        Ok(PyArrowType(reader))
+    }
+
     #[pyo3(signature = (keys))]
     fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
@@ -3098,11 +3330,7 @@ impl Dataset {
 
             let vindex = self
                 .ds
-                .open_vector_index(
-                    column_name,
-                    &idx_meta.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
+                .open_vector_index(column_name, &idx_meta.uuid, &NoOpMetricsCollector)
                 .await
                 .infer_error()?;
 
@@ -3407,6 +3635,229 @@ impl Dataset {
             self.ds.clone(),
         ))
     }
+
+    /// Perform pairwise hamming distance clustering on a partition of an IVF_FLAT index.
+    ///
+    /// This function loads a specific partition from every segment of an IVF_FLAT
+    /// index on a hash column, computes pairwise hamming distances between all
+    /// hashes in the combined partition, filters by threshold, and clusters the
+    /// results using union-find.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the IVF_FLAT index on the hash column
+    /// partition_id : int
+    ///     The partition ID within the IVF_FLAT index
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    /// index_segments : list of str, optional
+    ///     If specified, only these physical index segment UUIDs of the named
+    ///     logical index contribute rows. Defaults to all segments.
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (index_name, partition_id, hamming_threshold, index_segments=None))]
+    fn hamming_clustering_for_ivf_partition(
+        &self,
+        py: Python<'_>,
+        index_name: &str,
+        partition_id: usize,
+        hamming_threshold: u32,
+        index_segments: Option<Vec<String>>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::{
+            hamming_clustering_for_ivf_partition, hamming_clustering_for_ivf_partition_segments,
+        };
+
+        let segment_ids = parse_index_segment_ids(index_segments)?;
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(Some(py), async {
+                match segment_ids.as_deref() {
+                    Some(segment_ids) => {
+                        hamming_clustering_for_ivf_partition_segments(
+                            ds,
+                            index_name,
+                            segment_ids,
+                            partition_id,
+                            hamming_threshold,
+                        )
+                        .await
+                    }
+                    None => {
+                        hamming_clustering_for_ivf_partition(
+                            ds,
+                            index_name,
+                            partition_id,
+                            hamming_threshold,
+                        )
+                        .await
+                    }
+                }
+            })?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
+
+    /// Get partition information for an IVF_FLAT index.
+    ///
+    /// Partition sizes are aggregated across all segments of the logical index
+    /// unless a subset is selected via ``index_segments``.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the IVF_FLAT index
+    /// index_segments : list of str, optional
+    ///     If specified, only these physical index segment UUIDs of the named
+    ///     logical index contribute to the sizes. Defaults to all segments.
+    ///
+    /// Returns
+    /// -------
+    /// List[dict]
+    ///     List of partition info dicts with 'partition_id' and 'size'
+    #[pyo3(signature = (index_name, index_segments=None))]
+    fn get_ivf_partition_info(
+        &self,
+        py: Python<'_>,
+        index_name: &str,
+        index_segments: Option<Vec<String>>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        use lance::index::vector::hamming::{
+            get_ivf_partition_info, get_ivf_partition_info_segments,
+        };
+
+        let segment_ids = parse_index_segment_ids(index_segments)?;
+        let ds = self.ds.as_ref();
+        let result = rt()
+            .block_on(Some(py), async {
+                match segment_ids.as_deref() {
+                    Some(segment_ids) => {
+                        get_ivf_partition_info_segments(ds, index_name, segment_ids).await
+                    }
+                    None => get_ivf_partition_info(ds, index_name).await,
+                }
+            })?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let partitions: PyResult<Vec<_>> = result
+            .iter()
+            .map(|p| {
+                let dict = PyDict::new(py);
+                dict.set_item("partition_id", p.partition_id)?;
+                dict.set_item("size", p.size)?;
+                Ok(dict.into())
+            })
+            .collect();
+
+        partitions
+    }
+
+    /// Perform pairwise hamming distance clustering on sampled rows from a dataset.
+    ///
+    /// This function samples N rows randomly from the dataset, extracts hashes,
+    /// computes pairwise hamming distances, and clusters the results.
+    /// It's useful for benchmarking and testing without requiring an IVF index.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     Name of the hash column (must be FixedSizeList<UInt8, N> where N is
+    ///     a positive multiple of 8 bytes)
+    /// sample_size : int, optional
+    ///     Number of rows to sample (if None or >= total rows, uses all rows)
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (column, sample_size, hamming_threshold))]
+    fn hamming_clustering_for_sample(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        sample_size: Option<usize>,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_sample;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_sample(ds, column, sample_size, hamming_threshold),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
+
+    /// Perform pairwise hamming distance clustering on a contiguous range of rows from a fragment.
+    ///
+    /// This function reads a contiguous range of rows from a specific fragment,
+    /// extracts hashes, computes pairwise hamming distances, and clusters the results.
+    /// Unlike sampling, this reads sequential rows which is useful for distributed
+    /// processing where each worker handles a specific range of a fragment.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     Name of the hash column (must be FixedSizeList<UInt8, N> where N is
+    ///     a positive multiple of 8 bytes)
+    /// fragment_id : int
+    ///     The fragment ID to read from
+    /// start_row : int
+    ///     The starting row offset within the fragment
+    /// num_rows : int
+    ///     Number of rows to read from the start position
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (column, fragment_id, start_row, num_rows, hamming_threshold))]
+    fn hamming_clustering_for_range(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        fragment_id: usize,
+        start_row: usize,
+        num_rows: usize,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_range;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_range(
+                    ds,
+                    column,
+                    fragment_id,
+                    start_row,
+                    num_rows,
+                    hamming_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass, skip_from_py_object)]
@@ -3606,9 +4057,18 @@ impl PyWriteDest {
             Self::Uri(uri) => WriteDestination::Uri(uri),
         }
     }
+
+    /// The table root uri of this destination (a branch dataset resolves to
+    /// its main location). Used to root the namespace manifest store.
+    pub fn table_root_uri(&self) -> PyResult<String> {
+        match self {
+            Self::Dataset(ds) => Ok(ds.ds.branch_location().find_main().infer_error()?.uri),
+            Self::Uri(uri) => Ok(uri.to_string()),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum IndexProgressEventType {
     Start,
     Progress,
@@ -3764,7 +4224,20 @@ impl IndexProgressDispatcher {
 
     fn drain(&mut self) -> PyResult<()> {
         while let Ok(event) = self.receiver.try_recv() {
-            self.dispatch(event)?;
+            let is_complete = event.event == IndexProgressEventType::Complete;
+            if let Err(err) = self.dispatch(event) {
+                if is_complete {
+                    // Complete events are purely informational — the stage's work
+                    // is already done. Propagating a callback error here would
+                    // abort the operation after the real work has succeeded.
+                    log::warn!(
+                        "Ignoring progress callback error on stage-complete event: {}",
+                        err
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
@@ -3948,7 +4421,7 @@ pub fn write_dataset(
     dest: PyWriteDest,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
-    let params = get_write_params(options)?;
+    let params = get_write_params(options, &dest.table_root_uri()?)?;
     let py = options.py();
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
@@ -4017,8 +4490,13 @@ fn get_dict_opt<'py, D: FromPyObjectOwned<'py>>(
         .transpose()
 }
 
+/// `table_uri` is the destination table's root uri; it roots the namespace
+/// manifest store when `namespace_client_managed_versioning` is requested.
 #[allow(deprecated)]
-pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WriteParams>> {
+pub fn get_write_params(
+    options: &Bound<'_, PyDict>,
+    table_uri: &str,
+) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
@@ -4136,6 +4614,11 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p = p.with_target_base_names_or_paths(target_bases_list);
         }
 
+        // Handle target_all_bases parameter (bool: include primary storage)
+        if let Some(target_all_bases) = get_dict_opt::<bool>(options, "target_all_bases")? {
+            p = p.with_target_all_bases(target_all_bases);
+        }
+
         // Handle base_store_params: per-base storage options keyed by base path URI
         if let Some(base_store_params) =
             get_dict_opt::<HashMap<String, HashMap<String, String>>>(options, "base_store_params")?
@@ -4188,9 +4671,15 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             && let (Some(ns_client), Some(table_id)) =
                 (namespace_client_opt.as_ref(), table_id_opt.as_ref())
         {
+            // The store derives the branch a request targets from the base path
+            // it is handed, resolved against the table root.
             let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(ns_client, table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                ns_client,
+                table_id.clone(),
+                table_uri,
+            )
+            .infer_error()?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -4359,6 +4848,13 @@ fn prepare_vector_index_params(
             }
             let codebook = as_fixed_size_list_array(batch.column(0));
             pq_params.codebook = Some(codebook.values().clone())
+        };
+
+        if let Some(r) = kwargs.get_item("rabitq_model")? {
+            let json: String = r.extract()?;
+            let meta: RabitQuantizationMetadata = serde_json::from_str(&json)
+                .map_err(|e| PyValueError::new_err(format!("Invalid rabitq_model JSON: {e}")))?;
+            rq_params.rotation = Some(meta);
         };
 
         if let Some(version) = kwargs.get_item("index_file_version")? {
@@ -4681,6 +5177,7 @@ type VectorQueryParams = (
     bool,
     Option<usize>,
     i32,
+    ApproxMode,
 );
 
 fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
@@ -4699,6 +5196,23 @@ fn vector_query_query_parallelism_from_dict(dict: &Bound<'_, PyDict>) -> PyResul
         extract_query_parallelism(&query_parallelism)
     } else {
         Ok(DEFAULT_QUERY_PARALLELISM)
+    }
+}
+
+fn vector_query_approx_mode_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<ApproxMode> {
+    if let Some(approx_mode) = dict.get_item("approx_mode")?
+        && !approx_mode.is_none()
+    {
+        match approx_mode.to_string().to_lowercase().as_str() {
+            "fast" => Ok(ApproxMode::Fast),
+            "normal" => Ok(ApproxMode::Normal),
+            "accurate" => Ok(ApproxMode::Accurate),
+            value => Err(PyValueError::new_err(format!(
+                "approx_mode must be one of 'fast', 'normal', or 'accurate', got '{value}'"
+            ))),
+        }
+    } else {
+        Ok(ApproxMode::Normal)
     }
 }
 
@@ -4808,6 +5322,7 @@ fn vector_query_params_from_dict(
     };
 
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
+    let approx_mode = vector_query_approx_mode_from_dict(dict)?;
 
     Ok((
         column,
@@ -4820,6 +5335,7 @@ fn vector_query_params_from_dict(
         use_index,
         ef,
         query_parallelism,
+        approx_mode,
     ))
 }
 
@@ -4856,6 +5372,7 @@ impl PySearchFilter {
             use_index,
             ef,
             query_parallelism,
+            approx_mode,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
@@ -4874,6 +5391,7 @@ impl PySearchFilter {
             use_index,
             query_parallelism,
             dist_q_c: 0.0,
+            approx_mode,
         };
 
         Ok(Self {

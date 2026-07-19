@@ -11,7 +11,7 @@
 //! `RowDatasetVersionMeta::Inline` bytes across many fragments.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
 
 use lance_table::format::pb;
@@ -59,6 +59,7 @@ fn make_uniform_pb_fragments(n: u64, num_fields: usize) -> Vec<pb::DataFragment>
                 file_size_bytes: 0,
                 base_id: None,
             }],
+            overlays: vec![],
             deletion_file: None,
             row_id_sequence: None,
             physical_rows: 1000,
@@ -135,6 +136,7 @@ fn make_diverse_pb_fragments(
                     file_size_bytes: 0,
                     base_id: None,
                 }],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_sequence: None,
                 physical_rows: 1000,

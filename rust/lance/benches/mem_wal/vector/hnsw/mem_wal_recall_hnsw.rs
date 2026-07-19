@@ -385,6 +385,8 @@ async fn run_checkpoint(
     }
     let writer_config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: false,
         sync_indexed_write: true,
@@ -542,8 +544,7 @@ async fn run_checkpoint(
         let uuid = idx_metas
             .first()
             .ok_or_else(|| lance_core::Error::io("flushed gen has no vector index".to_string()))?
-            .uuid
-            .to_string();
+            .uuid;
         let vidx = gen_ds
             .open_vector_index(VECTOR_COL, &uuid, &NoOpMetricsCollector)
             .await?;
@@ -590,6 +591,7 @@ async fn run_checkpoint(
                     use_index: true,
                     query_parallelism: 1,
                     dist_q_c: 0.0,
+                    approx_mode: Default::default(),
                 };
                 // IVFIndex::search is intentionally unimplemented (top-level does
                 // partition-aware search); replicate the ANN exec node: pick the
@@ -665,7 +667,7 @@ async fn run_checkpoint(
             active.schema.clone(),
         );
         let q_arr: ArrayRef = Arc::new(q_fsl);
-        scanner.nearest(VECTOR_COL, q_arr, k);
+        scanner.nearest(VECTOR_COL, q_arr.as_ref(), k)?;
         let h_t = Instant::now();
         let stream = scanner.try_into_stream().await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
